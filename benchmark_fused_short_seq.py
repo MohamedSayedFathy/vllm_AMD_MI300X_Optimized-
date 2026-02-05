@@ -79,7 +79,7 @@ def run_single_benchmark(
                 capture_output=True,
                 text=True,
                 env=env,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
+                cwd=os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks", "kernels"),
                 timeout=120,
             )
 
