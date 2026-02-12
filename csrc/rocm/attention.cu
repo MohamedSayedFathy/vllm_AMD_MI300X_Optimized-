@@ -3378,6 +3378,7 @@ void paged_attention_custom_launcher(
 
   if (use_single_partition) {
     // Single partition path: write directly to final_out, skip reduce kernel
+    // Experiment: use mfma4 for ALL GQA ratios (not just 1-4)
     switch (gqa_ratio) {
       case 1:
         LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(1);
@@ -3392,40 +3393,40 @@ void paged_attention_custom_launcher(
         LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(4);
         break;
       case 5:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(5);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(5);
         break;
       case 6:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(6);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(6);
         break;
       case 7:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(7);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(7);
         break;
       case 8:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(8);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(8);
         break;
       case 9:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(9);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(9);
         break;
       case 10:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(10);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(10);
         break;
       case 11:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(11);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(11);
         break;
       case 12:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(12);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(12);
         break;
       case 13:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(13);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(13);
         break;
       case 14:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(14);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(14);
         break;
       case 15:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(15);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(15);
         break;
       case 16:
-        LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE(16);
+        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(16);
         break;
       default:
         TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio);
@@ -3434,8 +3435,8 @@ void paged_attention_custom_launcher(
     return;  // Skip reduce kernel
   }
 
-  // Multi-partition path (original): write to tmp_out, then reduce
-  // mfma4 kernel is faster than mfma16 for gqa_ratio <= 4
+  // Multi-partition path: use mfma4 for ALL GQA ratios
+  // Experiment: mfma4 with DPP reductions vs mfma16 with __shfl_xor
   switch (gqa_ratio) {
     case 1:
       LAUNCH_CUSTOM_ATTENTION_MFMA4(1);
@@ -3450,40 +3451,40 @@ void paged_attention_custom_launcher(
       LAUNCH_CUSTOM_ATTENTION_MFMA4(4);
       break;
     case 5:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(5);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(5);
       break;
     case 6:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(6);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(6);
       break;
     case 7:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(7);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(7);
       break;
     case 8:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(8);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(8);
       break;
     case 9:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(9);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(9);
       break;
     case 10:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(10);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(10);
       break;
     case 11:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(11);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(11);
       break;
     case 12:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(12);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(12);
       break;
     case 13:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(13);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(13);
       break;
     case 14:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(14);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(14);
       break;
     case 15:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(15);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(15);
       break;
     case 16:
-      LAUNCH_CUSTOM_ATTENTION_MFMA16(16);
+      LAUNCH_CUSTOM_ATTENTION_MFMA4(16);
       break;
     default:
       TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio);
