@@ -40,12 +40,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
-RESULTS_REPO_URL = "https://github.com/MohamedSayedFathy/benchmark_results.git"
 RESULTS_DIR_NAME = "benchmark_results"
 
 
 # ============================================================================
-# Git Helpers
+# Git & Results Helpers
 # ============================================================================
 
 def get_git_branch(repo_dir: str = ".") -> str:
@@ -72,48 +71,14 @@ def get_git_commit(repo_dir: str = ".") -> str:
         return "unknown"
 
 
-def setup_results_repo(vllm_dir: str) -> str:
+def save_to_results_dir(data: dict, vllm_dir: str):
     """
-    Ensure the benchmark_results repo exists as a sibling directory.
-    Clones from GitHub if it doesn't exist, pulls if it does.
-    Returns the path to the results repo.
-    """
-    parent_dir = os.path.dirname(os.path.abspath(vllm_dir))
-    results_dir = os.path.join(parent_dir, RESULTS_DIR_NAME)
-
-    if os.path.isdir(os.path.join(results_dir, ".git")):
-        # Repo exists, pull latest
-        print(f"\n[Results] Found existing repo at {results_dir}")
-        subprocess.run(
-            ["git", "pull", "--rebase"],
-            cwd=results_dir, capture_output=True,
-        )
-    else:
-        # Try to clone
-        print(f"\n[Results] Cloning {RESULTS_REPO_URL}...")
-        result = subprocess.run(
-            ["git", "clone", RESULTS_REPO_URL, results_dir],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            # Repo doesn't exist on GitHub yet, init locally
-            print(f"[Results] Clone failed, initializing new repo at {results_dir}")
-            os.makedirs(results_dir, exist_ok=True)
-            subprocess.run(["git", "init"], cwd=results_dir)
-            subprocess.run(
-                ["git", "remote", "add", "origin", RESULTS_REPO_URL],
-                cwd=results_dir,
-            )
-
-    return results_dir
-
-
-def push_results(data: dict, vllm_dir: str):
-    """
-    Save benchmark results to the benchmark_results repo and push.
+    Save benchmark results to the benchmark_results/ directory
+    within the current repo.
     File is named: <branch>_<timestamp>.json
     """
-    results_dir = setup_results_repo(vllm_dir)
+    results_dir = os.path.join(vllm_dir, RESULTS_DIR_NAME)
+    os.makedirs(results_dir, exist_ok=True)
 
     branch = data["metadata"].get("git_branch", "unknown")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -125,33 +90,6 @@ def push_results(data: dict, vllm_dir: str):
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2)
     print(f"[Results] Saved: {filepath}")
-
-    # Git add, commit, push
-    subprocess.run(["git", "add", filename], cwd=results_dir)
-    commit_msg = f"benchmark: {branch} @ {timestamp}"
-    subprocess.run(
-        ["git", "commit", "-m", commit_msg],
-        cwd=results_dir, capture_output=True,
-    )
-
-    result = subprocess.run(
-        ["git", "push", "-u", "origin", "main"],
-        cwd=results_dir, capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        print(f"[Results] Pushed to {RESULTS_REPO_URL}")
-    else:
-        # Try pushing to master if main doesn't exist
-        result2 = subprocess.run(
-            ["git", "push", "-u", "origin", "master"],
-            cwd=results_dir, capture_output=True, text=True,
-        )
-        if result2.returncode == 0:
-            print(f"[Results] Pushed to {RESULTS_REPO_URL}")
-        else:
-            print(f"[Results] Push failed (you may need to create the repo on GitHub first)")
-            print(f"[Results] Error: {result.stderr.strip()}")
-            print(f"[Results] Results saved locally at: {filepath}")
 
 
 # ============================================================================
@@ -450,8 +388,8 @@ Examples:
                         help="Output JSON file path (default: results.json)")
     parser.add_argument("--markdown", action="store_true",
                         help="Also print markdown table for reports")
-    parser.add_argument("--no-push", action="store_true",
-                        help="Don't push results to benchmark_results repo")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Don't save results to benchmark_results/ directory")
 
     args = parser.parse_args()
 
@@ -474,10 +412,10 @@ Examples:
     # Save JSON locally
     save_results(data, args.output)
 
-    # Push to benchmark_results repo
-    if not args.no_push:
+    # Save to benchmark_results/ directory in the repo
+    if not args.no_save:
         vllm_dir = os.path.dirname(os.path.abspath(__file__))
-        push_results(data, vllm_dir)
+        save_to_results_dir(data, vllm_dir)
 
     print("\n" + "=" * 70)
     print("Benchmark complete!")
