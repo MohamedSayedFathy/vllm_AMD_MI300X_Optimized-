@@ -76,6 +76,30 @@ inline bool is_fused_short_seq_enabled() {
   return cached == 1;
 }
 
+// Check if mfma4-for-all-GQA experiment is enabled
+// When enabled, uses mfma4 kernel for ALL GQA ratios (1-16) instead of
+// mfma16 for GQA 5-16. Disabled by default.
+inline bool is_mfma4_all_enabled() {
+  static int cached = -1;
+  if (cached == -1) {
+    const char* env = std::getenv("VLLM_ROCM_MFMA4_ALL");
+    cached = (env != nullptr && std::strcmp(env, "1") == 0) ? 1 : 0;
+  }
+  return cached == 1;
+}
+
+// Check if 512-token partition size is enabled (only with mfma4-for-all)
+// When enabled, uses partition_size=512 with NTHR=512, extending single-partition
+// optimization to sequences up to 512 tokens. Disabled by default.
+inline bool is_partition_512_enabled() {
+  static int cached = -1;
+  if (cached == -1) {
+    const char* env = std::getenv("VLLM_ROCM_PARTITION_512");
+    cached = (env != nullptr && std::strcmp(env, "1") == 0) ? 1 : 0;
+  }
+  return cached == 1;
+}
+
 enum class MFMAType {
   F16 = 0,
   Fp8 = 1,
@@ -3307,6 +3331,50 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
           out_ptr, exp_sums_ptr, max_logits_ptr, tmp_out_ptr, seq_lens_ptr, \
           query_start_loc_ptr, max_num_partitions, fp8_out_scale_ptr);
 
+// ---- GQA dispatch helpers ----
+// All GQA ratios use the same kernel variant
+#define DISPATCH_GQA_ALL(LAUNCH_MACRO)                                        \
+  switch (gqa_ratio) {                                                        \
+    case 1:  LAUNCH_MACRO(1);  break; case 2:  LAUNCH_MACRO(2);  break;      \
+    case 3:  LAUNCH_MACRO(3);  break; case 4:  LAUNCH_MACRO(4);  break;      \
+    case 5:  LAUNCH_MACRO(5);  break; case 6:  LAUNCH_MACRO(6);  break;      \
+    case 7:  LAUNCH_MACRO(7);  break; case 8:  LAUNCH_MACRO(8);  break;      \
+    case 9:  LAUNCH_MACRO(9);  break; case 10: LAUNCH_MACRO(10); break;      \
+    case 11: LAUNCH_MACRO(11); break; case 12: LAUNCH_MACRO(12); break;      \
+    case 13: LAUNCH_MACRO(13); break; case 14: LAUNCH_MACRO(14); break;      \
+    case 15: LAUNCH_MACRO(15); break; case 16: LAUNCH_MACRO(16); break;      \
+    default: TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio); break; \
+  }
+
+// GQA 1-4 use MACRO4, GQA 5-16 use MACRO16 (original mixed dispatch)
+#define DISPATCH_GQA_MIXED(LAUNCH_MACRO4, LAUNCH_MACRO16)                     \
+  switch (gqa_ratio) {                                                        \
+    case 1:  LAUNCH_MACRO4(1);  break; case 2:  LAUNCH_MACRO4(2);  break;    \
+    case 3:  LAUNCH_MACRO4(3);  break; case 4:  LAUNCH_MACRO4(4);  break;    \
+    case 5:  LAUNCH_MACRO16(5);  break; case 6:  LAUNCH_MACRO16(6);  break;  \
+    case 7:  LAUNCH_MACRO16(7);  break; case 8:  LAUNCH_MACRO16(8);  break;  \
+    case 9:  LAUNCH_MACRO16(9);  break; case 10: LAUNCH_MACRO16(10); break;  \
+    case 11: LAUNCH_MACRO16(11); break; case 12: LAUNCH_MACRO16(12); break;  \
+    case 13: LAUNCH_MACRO16(13); break; case 14: LAUNCH_MACRO16(14); break;  \
+    case 15: LAUNCH_MACRO16(15); break; case 16: LAUNCH_MACRO16(16); break;  \
+    default: TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio); break; \
+  }
+
+// Reduce kernel dispatch
+#define DISPATCH_REDUCTION()                                                  \
+  switch (npar_loops) {                                                       \
+    case 1: LAUNCH_CUSTOM_REDUCTION(1); break;                                \
+    case 2: LAUNCH_CUSTOM_REDUCTION(2); break;                                \
+    case 3: LAUNCH_CUSTOM_REDUCTION(3); break;                                \
+    case 4: LAUNCH_CUSTOM_REDUCTION(4); break;                                \
+    case 5: LAUNCH_CUSTOM_REDUCTION(5); break;                                \
+    case 6: LAUNCH_CUSTOM_REDUCTION(6); break;                                \
+    case 7: LAUNCH_CUSTOM_REDUCTION(7); break;                                \
+    case 8: LAUNCH_CUSTOM_REDUCTION(8); break;                                \
+    default: TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops);      \
+             break;                                                           \
+  }
+
 template <typename T, typename KVT, vllm::Fp8KVCacheDataType KV_DTYPE,
           int BLOCK_SIZE, int HEAD_SIZE, typename OUTT, int PARTITION_SIZE_OLD,
           bool ALIBI_ENABLED, MFMAType MFMA_TYPE>
@@ -3357,173 +3425,77 @@ void paged_attention_custom_launcher(
   OUTT* out_ptr = reinterpret_cast<OUTT*>(out.data_ptr());
 
   const int max_ctx_blocks = DIVIDE_ROUND_UP(max_seq_len, BLOCK_SIZE);
-
-  // partition size is fixed at 256 since both mfma4 and mfma16 kernels support
-  // it mfma4 kernel also supports partition size 512
-  constexpr int PARTITION_SIZE = 256;
-  const int max_num_partitions = DIVIDE_ROUND_UP(max_seq_len, PARTITION_SIZE);
   const int gqa_ratio = num_heads / num_kv_heads;
   assert(num_heads % num_kv_heads == 0);
   assert(head_size == HEAD_SIZE);
 
-  constexpr int NTHR = 256;
-  dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
-  dim3 block(NTHR);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  // Check if single-partition optimization applies (seq_len <= 256)
-  const bool use_single_partition =
-      (max_num_partitions == 1) && is_fused_short_seq_enabled();
+  // Runtime experiment toggles:
+  //   VLLM_ROCM_MFMA4_ALL=1     -> use mfma4 for all GQA ratios (1-16)
+  //   VLLM_ROCM_PARTITION_512=1  -> 512-token partitions (only with mfma4_all)
+  //   VLLM_ROCM_FUSED_SHORT_SEQ  -> fused single-partition (skip reduce)
+  const bool use_mfma4_all = is_mfma4_all_enabled();
+  const bool use_partition_512 = use_mfma4_all && is_partition_512_enabled();
 
-  if (use_single_partition) {
-    // Single partition path: write directly to final_out, skip reduce kernel
-    // Experiment: use mfma4 for ALL GQA ratios (not just 1-4)
-    switch (gqa_ratio) {
-      case 1:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(1);
-        break;
-      case 2:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(2);
-        break;
-      case 3:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(3);
-        break;
-      case 4:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(4);
-        break;
-      case 5:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(5);
-        break;
-      case 6:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(6);
-        break;
-      case 7:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(7);
-        break;
-      case 8:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(8);
-        break;
-      case 9:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(9);
-        break;
-      case 10:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(10);
-        break;
-      case 11:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(11);
-        break;
-      case 12:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(12);
-        break;
-      case 13:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(13);
-        break;
-      case 14:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(14);
-        break;
-      case 15:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(15);
-        break;
-      case 16:
-        LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE(16);
-        break;
-      default:
-        TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio);
-        break;
+  if (use_partition_512) {
+    // ---- 512-token partition path (mfma4 only, NTHR=512) ----
+    constexpr int PARTITION_SIZE = 512;
+    const int max_num_partitions =
+        DIVIDE_ROUND_UP(max_seq_len, PARTITION_SIZE);
+    constexpr int NTHR = 512;
+    dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
+    dim3 block(NTHR);
+
+    const bool use_single_partition =
+        (max_num_partitions == 1) && is_fused_short_seq_enabled();
+
+    if (use_single_partition) {
+      DISPATCH_GQA_ALL(LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE);
+      return;
     }
-    return;  // Skip reduce kernel
-  }
 
-  // Multi-partition path: use mfma4 for ALL GQA ratios
-  // Experiment: mfma4 with DPP reductions vs mfma16 with __shfl_xor
-  switch (gqa_ratio) {
-    case 1:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(1);
-      break;
-    case 2:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(2);
-      break;
-    case 3:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(3);
-      break;
-    case 4:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(4);
-      break;
-    case 5:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(5);
-      break;
-    case 6:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(6);
-      break;
-    case 7:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(7);
-      break;
-    case 8:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(8);
-      break;
-    case 9:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(9);
-      break;
-    case 10:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(10);
-      break;
-    case 11:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(11);
-      break;
-    case 12:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(12);
-      break;
-    case 13:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(13);
-      break;
-    case 14:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(14);
-      break;
-    case 15:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(15);
-      break;
-    case 16:
-      LAUNCH_CUSTOM_ATTENTION_MFMA4(16);
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio);
-      break;
-  }
+    DISPATCH_GQA_ALL(LAUNCH_CUSTOM_ATTENTION_MFMA4);
 
-  dim3 reduce_grid(num_heads, num_seqs);
-  dim3 reduce_block(head_size);
-  const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
-  // reduction kernel supports upto 8 NPAR_loops * 64 (warp_size) * 256
-  // (partition size) = 128K context length
-  switch (npar_loops) {
-    case 1:
-      LAUNCH_CUSTOM_REDUCTION(1);
-      break;
-    case 2:
-      LAUNCH_CUSTOM_REDUCTION(2);
-      break;
-    case 3:
-      LAUNCH_CUSTOM_REDUCTION(3);
-      break;
-    case 4:
-      LAUNCH_CUSTOM_REDUCTION(4);
-      break;
-    case 5:
-      LAUNCH_CUSTOM_REDUCTION(5);
-      break;
-    case 6:
-      LAUNCH_CUSTOM_REDUCTION(6);
-      break;
-    case 7:
-      LAUNCH_CUSTOM_REDUCTION(7);
-      break;
-    case 8:
-      LAUNCH_CUSTOM_REDUCTION(8);
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops);
-      break;
+    dim3 reduce_grid(num_heads, num_seqs);
+    dim3 reduce_block(head_size);
+    const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
+    DISPATCH_REDUCTION();
+
+  } else {
+    // ---- Standard 256-token partition path ----
+    constexpr int PARTITION_SIZE = 256;
+    const int max_num_partitions =
+        DIVIDE_ROUND_UP(max_seq_len, PARTITION_SIZE);
+    constexpr int NTHR = 256;
+    dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
+    dim3 block(NTHR);
+
+    const bool use_single_partition =
+        (max_num_partitions == 1) && is_fused_short_seq_enabled();
+
+    if (use_single_partition) {
+      if (use_mfma4_all) {
+        DISPATCH_GQA_ALL(LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE);
+      } else {
+        DISPATCH_GQA_MIXED(LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE,
+                           LAUNCH_CUSTOM_ATTENTION_MFMA16_SINGLE);
+      }
+      return;
+    }
+
+    if (use_mfma4_all) {
+      DISPATCH_GQA_ALL(LAUNCH_CUSTOM_ATTENTION_MFMA4);
+    } else {
+      DISPATCH_GQA_MIXED(LAUNCH_CUSTOM_ATTENTION_MFMA4,
+                         LAUNCH_CUSTOM_ATTENTION_MFMA16);
+    }
+
+    dim3 reduce_grid(num_heads, num_seqs);
+    dim3 reduce_block(head_size);
+    const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
+    DISPATCH_REDUCTION();
   }
 }
 

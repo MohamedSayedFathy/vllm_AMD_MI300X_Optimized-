@@ -26,6 +26,12 @@ Usage:
     # Include markdown table for report
     python benchmark_fused_short_seq.py --markdown
 
+    # Test mfma4-for-all-GQA experiment
+    python benchmark_fused_short_seq.py --mfma4-all
+
+    # Test mfma4-for-all with 512-token partitions (fused up to seq_len=512)
+    python benchmark_fused_short_seq.py --mfma4-all --partition-512
+
 Graph generation is handled separately by benchmark_visualization.py:
     python benchmark_visualization.py --data-file results.json --graphs all
 """
@@ -104,11 +110,15 @@ def run_single_benchmark(
     num_query_heads: int = 64,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    mfma4_all: bool = False,
+    partition_512: bool = False,
 ) -> float:
     """Run the paged attention benchmark and return average latency in microseconds."""
 
     env = os.environ.copy()
     env["VLLM_ROCM_FUSED_SHORT_SEQ"] = "1" if optimized else "0"
+    env["VLLM_ROCM_MFMA4_ALL"] = "1" if mfma4_all else "0"
+    env["VLLM_ROCM_PARTITION_512"] = "1" if partition_512 else "0"
 
     cmd = [
         sys.executable,
@@ -161,6 +171,8 @@ def run_benchmark_suite(
     num_query_heads: int = 64,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    mfma4_all: bool = False,
+    partition_512: bool = False,
 ) -> dict:
     """
     Run full A/B benchmark suite.
@@ -174,6 +186,9 @@ def run_benchmark_suite(
     print("\n" + "=" * 70)
     print("Fused Short-Seq Kernel Optimization Benchmark")
     print("=" * 70)
+    partition_size = 512 if partition_512 else 256
+    kernel_mode = "mfma4 (all GQA)" if mfma4_all else "mixed (mfma4/mfma16)"
+
     print(f"\nConfiguration:")
     print(f"  Sequence lengths:  {seq_lengths}")
     print(f"  Batch sizes:       {batch_sizes}")
@@ -181,7 +196,8 @@ def run_benchmark_suite(
     print(f"  Query heads:       {num_query_heads}")
     print(f"  KV heads:          {num_kv_heads}")
     print(f"  Head size:         {head_size}")
-    print(f"  Partition size:    256 tokens")
+    print(f"  Partition size:    {partition_size} tokens")
+    print(f"  Kernel mode:       {kernel_mode}")
     print(f"  Total configs:     {total}")
     print("-" * 70)
 
@@ -197,7 +213,8 @@ def run_benchmark_suite(
             optimized_us = run_single_benchmark(
                 seq_len, batch_size, num_runs, optimized=True,
                 num_query_heads=num_query_heads, num_kv_heads=num_kv_heads,
-                head_size=head_size,
+                head_size=head_size, mfma4_all=mfma4_all,
+                partition_512=partition_512,
             )
             print(f"{optimized_us:.3f} us")
 
@@ -206,7 +223,8 @@ def run_benchmark_suite(
             baseline_us = run_single_benchmark(
                 seq_len, batch_size, num_runs, optimized=False,
                 num_query_heads=num_query_heads, num_kv_heads=num_kv_heads,
-                head_size=head_size,
+                head_size=head_size, mfma4_all=mfma4_all,
+                partition_512=partition_512,
             )
             print(f"{baseline_us:.3f} us")
 
@@ -214,8 +232,8 @@ def run_benchmark_suite(
             improvement_us = baseline_us - optimized_us
             improvement_pct = ((improvement_us / baseline_us) * 100) if baseline_us > 0 else 0.0
             speedup = (baseline_us / optimized_us) if optimized_us > 0 else 1.0
-            applies = seq_len <= 256
-            num_partitions = (seq_len + 255) // 256
+            applies = seq_len <= partition_size
+            num_partitions = (seq_len + partition_size - 1) // partition_size
 
             marker = "YES" if applies else "no"
             print(f"  -> Improvement: {improvement_pct:.1f}%, Speedup: {speedup:.2f}x, "
@@ -248,7 +266,9 @@ def run_benchmark_suite(
             "num_query_heads": num_query_heads,
             "num_kv_heads": num_kv_heads,
             "head_size": head_size,
-            "partition_size": 256,
+            "partition_size": partition_size,
+            "mfma4_all": mfma4_all,
+            "partition_512": partition_512,
         },
         "results": results,
     }
@@ -293,7 +313,8 @@ def print_text_table(data: dict):
         avg_us = sum(r["improvement_us"] for r in opt) / len(opt)
         max_pct = max(r["improvement_pct"] for r in opt)
         avg_speedup = sum(r["speedup"] for r in opt) / len(opt)
-        print(f"\nOptimization active (seq_len <= 256):")
+        part_sz = data["metadata"].get("partition_size", 256)
+        print(f"\nOptimization active (seq_len <= {part_sz}):")
         print(f"  Avg improvement:  {avg_pct:.1f}%")
         print(f"  Max improvement:  {max_pct:.1f}%")
         print(f"  Avg speedup:      {avg_speedup:.2f}x")
@@ -302,7 +323,7 @@ def print_text_table(data: dict):
     # Check non-optimized (should show ~0 difference)
     non_opt = [r for r in results if not r["applies_optimization"]]
     if non_opt:
-        print(f"\nBaseline verification (seq_len > 256, should be ~0 difference):")
+        print(f"\nBaseline verification (seq_len > {part_sz}, should be ~0 difference):")
         for r in non_opt:
             print(f"  seq_len={r['seq_len']}: {abs(r['improvement_us']):.3f} us "
                   f"({abs(r['improvement_pct']):.1f}%)")
@@ -388,10 +409,17 @@ Examples:
                         help="Output JSON file path (default: results.json)")
     parser.add_argument("--markdown", action="store_true",
                         help="Also print markdown table for reports")
+    parser.add_argument("--mfma4-all", action="store_true",
+                        help="Use mfma4 kernel for ALL GQA ratios (VLLM_ROCM_MFMA4_ALL=1)")
+    parser.add_argument("--partition-512", action="store_true",
+                        help="Use 512-token partitions (VLLM_ROCM_PARTITION_512=1, requires --mfma4-all)")
     parser.add_argument("--no-save", action="store_true",
                         help="Don't save results to benchmark_results/ directory")
 
     args = parser.parse_args()
+
+    if args.partition_512 and not args.mfma4_all:
+        parser.error("--partition-512 requires --mfma4-all")
 
     # Run benchmarks
     data = run_benchmark_suite(
@@ -401,6 +429,8 @@ Examples:
         num_query_heads=args.num_query_heads,
         num_kv_heads=args.num_kv_heads,
         head_size=args.head_size,
+        mfma4_all=args.mfma4_all,
+        partition_512=args.partition_512,
     )
 
     # Print text results
