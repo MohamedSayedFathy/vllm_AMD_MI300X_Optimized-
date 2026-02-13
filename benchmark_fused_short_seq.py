@@ -32,6 +32,9 @@ Usage:
     # Test mfma4-for-all with 512-token partitions (fused up to seq_len=512)
     python benchmark_fused_short_seq.py --mfma4-all --partition-512
 
+    # Compare all 3 kernel configs side by side
+    python benchmark_fused_short_seq.py --compare-all
+
 Graph generation is handled separately by benchmark_visualization.py:
     python benchmark_visualization.py --data-file results.json --graphs all
 """
@@ -362,6 +365,162 @@ def save_results(data: dict, output_path: str):
 
 
 # ============================================================================
+# Compare-All Mode: 3-way side-by-side comparison
+# ============================================================================
+
+# The three kernel configurations to compare
+CONFIGS = [
+    {"name": "Original",   "short": "orig",    "mfma4_all": False, "partition_512": False},
+    {"name": "mfma4-all",  "short": "mfma4",   "mfma4_all": True,  "partition_512": False},
+    {"name": "mfma4+512",  "short": "m4+512",  "mfma4_all": True,  "partition_512": True},
+]
+
+
+def run_compare_all(
+    seq_lengths: List[int],
+    batch_sizes: List[int],
+    num_runs: int = 3,
+    num_query_heads: int = 64,
+    num_kv_heads: int = 8,
+    head_size: int = 128,
+) -> dict:
+    """
+    Run all 3 kernel configs for each (seq_len, batch_size) combination.
+    Returns structured data with results for each config.
+    """
+    total = len(seq_lengths) * len(batch_sizes)
+    current = 0
+
+    print("\n" + "=" * 70)
+    print("3-Way Kernel Comparison Benchmark")
+    print("=" * 70)
+    print(f"\nConfigurations tested:")
+    for cfg in CONFIGS:
+        m4 = "ON" if cfg["mfma4_all"] else "OFF"
+        p5 = "ON" if cfg["partition_512"] else "OFF"
+        print(f"  {cfg['name']:12s}  MFMA4_ALL={m4}  PARTITION_512={p5}")
+    print(f"\nSweep:")
+    print(f"  Sequence lengths:  {seq_lengths}")
+    print(f"  Batch sizes:       {batch_sizes}")
+    print(f"  Runs per config:   {num_runs}")
+    print(f"  Query heads:       {num_query_heads}")
+    print(f"  KV heads:          {num_kv_heads}")
+    print(f"  Head size:         {head_size}")
+    print(f"  Total combos:      {total} x 3 configs = {total * 3} benchmarks")
+    print("-" * 70)
+
+    results = []
+
+    for batch_size in batch_sizes:
+        for seq_len in seq_lengths:
+            current += 1
+            print(f"\n[{current}/{total}] seq_len={seq_len}, batch_size={batch_size}")
+
+            row = {"seq_len": seq_len, "batch_size": batch_size}
+
+            for cfg in CONFIGS:
+                label = cfg["name"]
+                print(f"  {label:12s} ...", end=" ", flush=True)
+                latency = run_single_benchmark(
+                    seq_len, batch_size, num_runs, optimized=True,
+                    num_query_heads=num_query_heads, num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    mfma4_all=cfg["mfma4_all"],
+                    partition_512=cfg["partition_512"],
+                )
+                row[cfg["short"]] = round(latency, 3)
+                print(f"{latency:.3f} us")
+
+            # Compute speedups relative to Original
+            orig = row["orig"]
+            if orig > 0:
+                row["mfma4_vs_orig"] = round(orig / row["mfma4"], 3) if row["mfma4"] > 0 else 0.0
+                row["m4_512_vs_orig"] = round(orig / row["m4+512"], 3) if row["m4+512"] > 0 else 0.0
+            else:
+                row["mfma4_vs_orig"] = 0.0
+                row["m4_512_vs_orig"] = 0.0
+
+            results.append(row)
+
+    vllm_dir = os.path.dirname(os.path.abspath(__file__))
+    data = {
+        "metadata": {
+            "mode": "compare_all",
+            "timestamp": datetime.now().isoformat(),
+            "git_branch": get_git_branch(vllm_dir),
+            "git_commit": get_git_commit(vllm_dir),
+            "seq_lengths": seq_lengths,
+            "batch_sizes": batch_sizes,
+            "num_runs": num_runs,
+            "num_query_heads": num_query_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_size": head_size,
+            "configs": [c["name"] for c in CONFIGS],
+        },
+        "results": results,
+    }
+    return data
+
+
+def print_comparison_table(data: dict):
+    """Print side-by-side comparison of all 3 kernel configs."""
+    results = data["results"]
+    if not results:
+        print("No results to display.")
+        return
+
+    print("\n" + "=" * 110)
+    print("3-WAY COMPARISON (all with FUSED_SHORT_SEQ=1)")
+    print("=" * 110)
+
+    header = (f"{'Seq':>6} | {'Batch':>5} | "
+              f"{'Original':>11} | {'mfma4-all':>11} | {'mfma4+512':>11} | "
+              f"{'m4 vs orig':>10} | {'m4+512 vs orig':>14}")
+    print(f"\n{header}")
+    print("-" * 110)
+
+    for r in sorted(results, key=lambda x: (x["batch_size"], x["seq_len"])):
+        m4_speedup = r["mfma4_vs_orig"]
+        m4_512_speedup = r["m4_512_vs_orig"]
+        # Color hints: mark speedups > 1.0
+        m4_tag = "+" if m4_speedup > 1.005 else ("-" if m4_speedup < 0.995 else "=")
+        m4_512_tag = "+" if m4_512_speedup > 1.005 else ("-" if m4_512_speedup < 0.995 else "=")
+
+        print(f"{r['seq_len']:>6} | {r['batch_size']:>5} | "
+              f"{r['orig']:>9.3f}us | {r['mfma4']:>9.3f}us | {r['m4+512']:>9.3f}us | "
+              f"{m4_tag}{m4_speedup:>8.3f}x | {m4_512_tag}{m4_512_speedup:>12.3f}x")
+
+    print("-" * 110)
+
+    # Summary
+    print("\n  Legend:  + = faster than original, - = slower, = = same")
+    print(f"  Configs: Original = mixed mfma4/mfma16, partition 256")
+    print(f"           mfma4-all = mfma4 for all GQA, partition 256")
+    print(f"           mfma4+512 = mfma4 for all GQA, partition 512")
+
+
+def print_comparison_markdown(data: dict):
+    """Print comparison in markdown format."""
+    results = data["results"]
+    if not results:
+        return
+
+    print("\n" + "=" * 70)
+    print("MARKDOWN TABLE (copy into report)")
+    print("=" * 70 + "\n")
+
+    print("| Seq Len | Batch | Original (us) | mfma4-all (us) | mfma4+512 (us) | "
+          "m4 speedup | m4+512 speedup |")
+    print("|---------|-------|---------------|----------------|----------------|"
+          "------------|----------------|")
+
+    for r in sorted(results, key=lambda x: (x["batch_size"], x["seq_len"])):
+        print(f"| {r['seq_len']} | {r['batch_size']} | "
+              f"{r['orig']:.3f} | {r['mfma4']:.3f} | {r['m4+512']:.3f} | "
+              f"{r['mfma4_vs_orig']:.3f}x | {r['m4_512_vs_orig']:.3f}x |")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -413,6 +572,8 @@ Examples:
                         help="Use mfma4 kernel for ALL GQA ratios (VLLM_ROCM_MFMA4_ALL=1)")
     parser.add_argument("--partition-512", action="store_true",
                         help="Use 512-token partitions (VLLM_ROCM_PARTITION_512=1, requires --mfma4-all)")
+    parser.add_argument("--compare-all", action="store_true",
+                        help="Run all 3 configs side by side: original, mfma4-all, mfma4+512")
     parser.add_argument("--no-save", action="store_true",
                         help="Don't save results to benchmark_results/ directory")
 
@@ -421,23 +582,34 @@ Examples:
     if args.partition_512 and not args.mfma4_all:
         parser.error("--partition-512 requires --mfma4-all")
 
-    # Run benchmarks
-    data = run_benchmark_suite(
-        seq_lengths=args.seq_lengths,
-        batch_sizes=args.batch_sizes,
-        num_runs=args.num_runs,
-        num_query_heads=args.num_query_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_size=args.head_size,
-        mfma4_all=args.mfma4_all,
-        partition_512=args.partition_512,
-    )
-
-    # Print text results
-    print_text_table(data)
-
-    if args.markdown:
-        print_markdown_table(data)
+    if args.compare_all:
+        # ---- 3-way comparison mode ----
+        data = run_compare_all(
+            seq_lengths=args.seq_lengths,
+            batch_sizes=args.batch_sizes,
+            num_runs=args.num_runs,
+            num_query_heads=args.num_query_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_size=args.head_size,
+        )
+        print_comparison_table(data)
+        if args.markdown:
+            print_comparison_markdown(data)
+    else:
+        # ---- Single-config A/B mode ----
+        data = run_benchmark_suite(
+            seq_lengths=args.seq_lengths,
+            batch_sizes=args.batch_sizes,
+            num_runs=args.num_runs,
+            num_query_heads=args.num_query_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_size=args.head_size,
+            mfma4_all=args.mfma4_all,
+            partition_512=args.partition_512,
+        )
+        print_text_table(data)
+        if args.markdown:
+            print_markdown_table(data)
 
     # Save JSON locally
     save_results(data, args.output)
@@ -450,7 +622,6 @@ Examples:
     print("\n" + "=" * 70)
     print("Benchmark complete!")
     print(f"Results saved to: {args.output}")
-    print(f"Generate graphs:  python benchmark_visualization.py --data-file {args.output} --graphs all")
     print("=" * 70 + "\n")
 
 
