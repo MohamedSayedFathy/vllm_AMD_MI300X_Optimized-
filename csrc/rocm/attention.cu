@@ -100,6 +100,20 @@ inline bool is_partition_512_enabled() {
   return cached == 1;
 }
 
+// Check if 1024-token partition size is enabled (only with mfma4-for-all)
+// When enabled, uses partition_size=1024 with NTHR=1024, extending single-partition
+// optimization to sequences up to 1024 tokens. Disabled by default.
+// WARNING: NTHR=1024 gives only 128 VGPRs/wave (4 waves/SIMD), kernel needs ~150.
+// This WILL cause register spilling. Use for experimental comparison only.
+inline bool is_partition_1024_enabled() {
+  static int cached = -1;
+  if (cached == -1) {
+    const char* env = std::getenv("VLLM_ROCM_PARTITION_1024");
+    cached = (env != nullptr && std::strcmp(env, "1") == 0) ? 1 : 0;
+  }
+  return cached == 1;
+}
+
 enum class MFMAType {
   F16 = 0,
   Fp8 = 1,
@@ -3433,13 +3447,70 @@ void paged_attention_custom_launcher(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   // Runtime experiment toggles:
-  //   VLLM_ROCM_MFMA4_ALL=1     -> use mfma4 for all GQA ratios (1-16)
-  //   VLLM_ROCM_PARTITION_512=1  -> 512-token partitions (only with mfma4_all)
+  //   VLLM_ROCM_MFMA4_ALL=1      -> use mfma4 for all GQA ratios (1-16)
+  //   VLLM_ROCM_PARTITION_512=1   -> 512-token partitions (only with mfma4_all)
+  //   VLLM_ROCM_PARTITION_1024=1  -> 1024-token partitions (only with mfma4_all)
   //   VLLM_ROCM_FUSED_SHORT_SEQ  -> fused single-partition (skip reduce)
   const bool use_mfma4_all = is_mfma4_all_enabled();
-  const bool use_partition_512 = use_mfma4_all && is_partition_512_enabled();
+  const bool use_partition_1024 = use_mfma4_all && is_partition_1024_enabled();
+  const bool use_partition_512 = use_mfma4_all && !use_partition_1024 && is_partition_512_enabled();
 
-  if (use_partition_512) {
+  // Debug: print dispatch path once per process
+  static bool debug_printed = false;
+  if (!debug_printed) {
+    const char* debug_env = std::getenv("VLLM_ROCM_KERNEL_DEBUG");
+    if (debug_env != nullptr && std::strcmp(debug_env, "1") == 0) {
+      fprintf(stderr, "[KERNEL DEBUG] mfma4_all=%d partition_512=%d partition_1024=%d "
+              "fused=%d gqa_ratio=%d max_seq_len=%d\n",
+              (int)use_mfma4_all, (int)use_partition_512, (int)use_partition_1024,
+              (int)is_fused_short_seq_enabled(), gqa_ratio, max_seq_len);
+      if (use_partition_1024) {
+        int nparts = DIVIDE_ROUND_UP(max_seq_len, 1024);
+        bool fused = (nparts == 1) && is_fused_short_seq_enabled();
+        fprintf(stderr, "[KERNEL DEBUG] -> PATH: mfma4 NTHR=1024 PARTITION=1024 "
+                "partitions=%d %s\n", nparts, fused ? "FUSED" : "MULTI+REDUCE");
+      } else if (use_partition_512) {
+        int nparts = DIVIDE_ROUND_UP(max_seq_len, 512);
+        bool fused = (nparts == 1) && is_fused_short_seq_enabled();
+        fprintf(stderr, "[KERNEL DEBUG] -> PATH: mfma4 NTHR=512 PARTITION=512 "
+                "partitions=%d %s\n", nparts, fused ? "FUSED" : "MULTI+REDUCE");
+      } else {
+        int nparts = DIVIDE_ROUND_UP(max_seq_len, 256);
+        bool fused = (nparts == 1) && is_fused_short_seq_enabled();
+        const char* kernel = use_mfma4_all ? "mfma4-all" : "mixed(mfma4/mfma16)";
+        fprintf(stderr, "[KERNEL DEBUG] -> PATH: %s NTHR=256 PARTITION=256 "
+                "partitions=%d %s\n", kernel, nparts, fused ? "FUSED" : "MULTI+REDUCE");
+      }
+      debug_printed = true;
+    }
+  }
+
+  if (use_partition_1024) {
+    // ---- 1024-token partition path (mfma4 only, NTHR=1024) ----
+    // WARNING: 128 VGPRs/wave may cause register spilling
+    constexpr int PARTITION_SIZE = 1024;
+    const int max_num_partitions =
+        DIVIDE_ROUND_UP(max_seq_len, PARTITION_SIZE);
+    constexpr int NTHR = 1024;
+    dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
+    dim3 block(NTHR);
+
+    const bool use_single_partition =
+        (max_num_partitions == 1) && is_fused_short_seq_enabled();
+
+    if (use_single_partition) {
+      DISPATCH_GQA_ALL(LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE);
+      return;
+    }
+
+    DISPATCH_GQA_ALL(LAUNCH_CUSTOM_ATTENTION_MFMA4);
+
+    dim3 reduce_grid(num_heads, num_seqs);
+    dim3 reduce_block(head_size);
+    const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
+    DISPATCH_REDUCTION();
+
+  } else if (use_partition_512) {
     // ---- 512-token partition path (mfma4 only, NTHR=512) ----
     constexpr int PARTITION_SIZE = 512;
     const int max_num_partitions =
