@@ -1,0 +1,270 @@
+{
+  "metadata": {
+    "timestamp": "2026-02-14T15:19:15.939149",
+    "git_branch": "rocm/mfma4-all-gqa",
+    "git_commit": "3a5fdf02e",
+    "modes": [
+      "baseline",
+      "fused",
+      "mfma4_all",
+      "mfma4_all_512"
+    ],
+    "seq_lengths": [
+      64,
+      128,
+      256,
+      512,
+      1024
+    ],
+    "batch_sizes": [
+      32
+    ],
+    "num_runs": 3,
+    "num_query_heads": 64,
+    "num_kv_heads": 8,
+    "head_size": 128,
+    "gqa_ratio": 8
+  },
+  "results": [
+    {
+      "mode": "baseline",
+      "mode_label": "Baseline",
+      "seq_len": 64,
+      "batch_size": 32,
+      "latency_us": 11.42,
+      "fused_active": false,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "fused",
+      "mode_label": "Fused",
+      "seq_len": 64,
+      "batch_size": 32,
+      "latency_us": 7.957,
+      "fused_active": true,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all",
+      "mode_label": "mfma4-all",
+      "seq_len": 64,
+      "batch_size": 32,
+      "latency_us": 9.312,
+      "fused_active": true,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all_512",
+      "mode_label": "mfma4+512",
+      "seq_len": 64,
+      "batch_size": 32,
+      "latency_us": 9.46,
+      "fused_active": true,
+      "partition_size": 512,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "baseline",
+      "mode_label": "Baseline",
+      "seq_len": 128,
+      "batch_size": 32,
+      "latency_us": 12.123,
+      "fused_active": false,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "fused",
+      "mode_label": "Fused",
+      "seq_len": 128,
+      "batch_size": 32,
+      "latency_us": 9.345,
+      "fused_active": true,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all",
+      "mode_label": "mfma4-all",
+      "seq_len": 128,
+      "batch_size": 32,
+      "latency_us": 8.826,
+      "fused_active": true,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all_512",
+      "mode_label": "mfma4+512",
+      "seq_len": 128,
+      "batch_size": 32,
+      "latency_us": 8.241,
+      "fused_active": true,
+      "partition_size": 512,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "baseline",
+      "mode_label": "Baseline",
+      "seq_len": 256,
+      "batch_size": 32,
+      "latency_us": 15.089,
+      "fused_active": false,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "fused",
+      "mode_label": "Fused",
+      "seq_len": 256,
+      "batch_size": 32,
+      "latency_us": 11.027,
+      "fused_active": true,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all",
+      "mode_label": "mfma4-all",
+      "seq_len": 256,
+      "batch_size": 32,
+      "latency_us": 10.717,
+      "fused_active": true,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all_512",
+      "mode_label": "mfma4+512",
+      "seq_len": 256,
+      "batch_size": 32,
+      "latency_us": 11.569,
+      "fused_active": true,
+      "partition_size": 512,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "baseline",
+      "mode_label": "Baseline",
+      "seq_len": 512,
+      "batch_size": 32,
+      "latency_us": 28.518,
+      "fused_active": false,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "fused",
+      "mode_label": "Fused",
+      "seq_len": 512,
+      "batch_size": 32,
+      "latency_us": 28.898,
+      "fused_active": false,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all",
+      "mode_label": "mfma4-all",
+      "seq_len": 512,
+      "batch_size": 32,
+      "latency_us": 29.293,
+      "fused_active": false,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all_512",
+      "mode_label": "mfma4+512",
+      "seq_len": 512,
+      "batch_size": 32,
+      "latency_us": 25.417,
+      "fused_active": true,
+      "partition_size": 512,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "baseline",
+      "mode_label": "Baseline",
+      "seq_len": 1024,
+      "batch_size": 32,
+      "latency_us": 46.79,
+      "fused_active": false,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "fused",
+      "mode_label": "Fused",
+      "seq_len": 1024,
+      "batch_size": 32,
+      "latency_us": 46.767,
+      "fused_active": false,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all",
+      "mode_label": "mfma4-all",
+      "seq_len": 1024,
+      "batch_size": 32,
+      "latency_us": 47.658,
+      "fused_active": false,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all_512",
+      "mode_label": "mfma4+512",
+      "seq_len": 1024,
+      "batch_size": 32,
+      "latency_us": 48.571,
+      "fused_active": false,
+      "partition_size": 512,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    }
+  ]
+}

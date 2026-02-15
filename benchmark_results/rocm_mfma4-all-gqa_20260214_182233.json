@@ -1,0 +1,74 @@
+{
+  "metadata": {
+    "timestamp": "2026-02-14T18:22:33.972974",
+    "git_branch": "rocm/mfma4-all-gqa",
+    "git_commit": "3a5fdf02e",
+    "modes": [
+      "baseline",
+      "fused",
+      "mfma4_all",
+      "mfma4_all_512"
+    ],
+    "seq_lengths": [
+      256
+    ],
+    "batch_sizes": [
+      32
+    ],
+    "num_runs": 3,
+    "num_query_heads": 64,
+    "num_kv_heads": 8,
+    "head_size": 128,
+    "gqa_ratio": 8
+  },
+  "results": [
+    {
+      "mode": "baseline",
+      "mode_label": "Baseline",
+      "seq_len": 256,
+      "batch_size": 32,
+      "latency_us": 21.152,
+      "fused_active": false,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "fused",
+      "mode_label": "Fused",
+      "seq_len": 256,
+      "batch_size": 32,
+      "latency_us": 14.637,
+      "fused_active": true,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all",
+      "mode_label": "mfma4-all",
+      "seq_len": 256,
+      "batch_size": 32,
+      "latency_us": 14.848,
+      "fused_active": true,
+      "partition_size": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    },
+    {
+      "mode": "mfma4_all_512",
+      "mode_label": "mfma4+512",
+      "seq_len": 256,
+      "batch_size": 32,
+      "latency_us": 14.658,
+      "fused_active": true,
+      "partition_size": 512,
+      "num_query_heads": 64,
+      "num_kv_heads": 8,
+      "head_size": 128
+    }
+  ]
+}
