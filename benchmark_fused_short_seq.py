@@ -514,88 +514,92 @@ def print_comparison_table(data: dict):
         return
 
     from collections import defaultdict
-    grouped = defaultdict(dict)
-    for r in results:
-        key = (r["seq_len"], r["batch_size"])
-        grouped[key][r["mode"]] = r
 
-    gqa = data["metadata"]["gqa_ratio"]
+    # Group by (num_kv_heads, seq_len, batch_size)
+    kv_heads_set = sorted(set(r.get("num_kv_heads", 8) for r in results))
+    num_query_heads = data["metadata"]["num_query_heads"]
 
-    print("\n" + "=" * (42 + 18 * len(mode_names)))
-    print("RESULTS COMPARISON")
-    print("=" * (42 + 18 * len(mode_names)))
-    print(f"  GQA ratio: {gqa} "
-          f"({data['metadata']['num_query_heads']}q / "
-          f"{data['metadata']['num_kv_heads']}kv)")
-    print(f"  Branch: {data['metadata'].get('git_branch', '?')} "
-          f"({data['metadata'].get('git_commit', '?')})")
+    for nkv in kv_heads_set:
+        kv_results = [r for r in results if r.get("num_kv_heads", 8) == nkv]
+        grouped = defaultdict(dict)
+        for r in kv_results:
+            key = (r["seq_len"], r["batch_size"])
+            grouped[key][r["mode"]] = r
 
-    # Header
-    mode_headers = "".join(
-        f" {'':>2}{MODES[m]['short']:>13}" for m in mode_names
-    )
-    print(f"\n{'Seq Len':>8} {'Batch':>6} |{mode_headers} | "
-          f"{'Best':>10} {'vs Base':>8}")
-    print("-" * (42 + 18 * len(mode_names)))
+        gqa = num_query_heads // nkv
 
-    for (seq_len, batch_size) in sorted(grouped.keys()):
-        modes = grouped[(seq_len, batch_size)]
+        print("\n" + "=" * (42 + 18 * len(mode_names)))
+        print(f"RESULTS COMPARISON  (GQA={gqa}, {num_query_heads}q/{nkv}kv)")
+        print("=" * (42 + 18 * len(mode_names)))
+        print(f"  Branch: {data['metadata'].get('git_branch', '?')} "
+              f"({data['metadata'].get('git_commit', '?')})")
 
-        latencies = {}
-        for m in mode_names:
-            if m in modes:
-                latencies[m] = modes[m]["latency_us"]
+        # Header
+        mode_headers = "".join(
+            f" {'':>2}{MODES[m]['short']:>13}" for m in mode_names
+        )
+        print(f"\n{'Seq Len':>8} {'Batch':>6} |{mode_headers} | "
+              f"{'Best':>10} {'vs Base':>8}")
+        print("-" * (42 + 18 * len(mode_names)))
 
-        if not latencies:
-            continue
+        for (seq_len, batch_size) in sorted(grouped.keys()):
+            modes = grouped[(seq_len, batch_size)]
 
-        baseline_us = latencies.get("baseline", 0)
+            latencies = {}
+            for m in mode_names:
+                if m in modes:
+                    latencies[m] = modes[m]["latency_us"]
 
-        cols = ""
-        for m in mode_names:
-            if m in latencies:
-                val = latencies[m]
-                fused = modes[m].get("fused_active", False)
-                marker = "*" if fused else " "
-                cols += f" {marker}{val:>12.1f}us"
-            else:
-                cols += f"  {'N/A':>12}  "
-
-        best_mode = min(latencies, key=lambda k: latencies[k])
-        best_us = latencies[best_mode]
-        if baseline_us > 0:
-            speedup = baseline_us / best_us
-            speedup_str = f"{speedup:.2f}x"
-        else:
-            speedup_str = "N/A"
-
-        print(f"{seq_len:>8} {batch_size:>6} |{cols} | "
-              f"{MODES[best_mode]['short']:>10} {speedup_str:>8}")
-
-    print("-" * (42 + 18 * len(mode_names)))
-    print("  * = fused (single-partition) path active")
-
-    # Per-mode summary vs baseline
-    if "baseline" in mode_names and len(mode_names) > 1:
-        print(f"\nSpeedup summary vs baseline:")
-        for m in mode_names:
-            if m == "baseline":
+            if not latencies:
                 continue
-            speedups = []
-            for key, modes in grouped.items():
-                if "baseline" in modes and m in modes:
-                    b = modes["baseline"]["latency_us"]
-                    o = modes[m]["latency_us"]
-                    if b > 0 and o > 0:
-                        speedups.append(b / o)
-            if speedups:
-                avg_sp = sum(speedups) / len(speedups)
-                max_sp = max(speedups)
-                min_sp = min(speedups)
-                print(f"  {MODES[m]['short']:<14}: "
-                      f"avg {avg_sp:.2f}x, "
-                      f"best {max_sp:.2f}x, "
-                      f"worst {min_sp:.2f}x")
+
+            baseline_us = latencies.get("baseline", 0)
+
+            cols = ""
+            for m in mode_names:
+                if m in latencies:
+                    val = latencies[m]
+                    fused = modes[m].get("fused_active", False)
+                    marker = "*" if fused else " "
+                    cols += f" {marker}{val:>12.1f}us"
+                else:
+                    cols += f"  {'N/A':>12}  "
+
+            best_mode = min(latencies, key=lambda k: latencies[k])
+            best_us = latencies[best_mode]
+            if baseline_us > 0:
+                speedup = baseline_us / best_us
+                speedup_str = f"{speedup:.2f}x"
+            else:
+                speedup_str = "N/A"
+
+            print(f"{seq_len:>8} {batch_size:>6} |{cols} | "
+                  f"{MODES[best_mode]['short']:>10} {speedup_str:>8}")
+
+        print("-" * (42 + 18 * len(mode_names)))
+        print("  * = fused (single-partition) path active")
+
+        # Per-mode summary vs baseline
+        if "baseline" in mode_names and len(mode_names) > 1:
+            print(f"\nSpeedup summary vs baseline:")
+            for m in mode_names:
+                if m == "baseline":
+                    continue
+                speedups = []
+                for key, modes in grouped.items():
+                    if "baseline" in modes and m in modes:
+                        b = modes["baseline"]["latency_us"]
+                        o = modes[m]["latency_us"]
+                        if b > 0 and o > 0:
+                            speedups.append(b / o)
+                if speedups:
+                    avg_sp = sum(speedups) / len(speedups)
+                    max_sp = max(speedups)
+                    min_sp = min(speedups)
+                    print(f"  {MODES[m]['short']:<14}: "
+                          f"avg {avg_sp:.2f}x, "
+                          f"best {max_sp:.2f}x, "
+                          f"worst {min_sp:.2f}x")
 
 
 def print_markdown_table(data: dict):
@@ -607,40 +611,48 @@ def print_markdown_table(data: dict):
         return
 
     from collections import defaultdict
-    grouped = defaultdict(dict)
-    for r in results:
-        key = (r["seq_len"], r["batch_size"])
-        grouped[key][r["mode"]] = r
 
-    print("\n" + "=" * 70)
-    print("MARKDOWN TABLE (copy into report)")
-    print("=" * 70 + "\n")
+    kv_heads_set = sorted(set(r.get("num_kv_heads", 8) for r in results))
+    num_query_heads = data["metadata"]["num_query_heads"]
 
-    mode_cols = " | ".join(f"{MODES[m]['short']} (us)" for m in mode_names)
-    print(f"| Seq Len | Batch | {mode_cols} | Best | Speedup |")
-    sep_cols = " | ".join("---:" for _ in mode_names)
-    print(f"|---------|-------|{sep_cols}|------|---------|")
+    for nkv in kv_heads_set:
+        kv_results = [r for r in results if r.get("num_kv_heads", 8) == nkv]
+        grouped = defaultdict(dict)
+        for r in kv_results:
+            key = (r["seq_len"], r["batch_size"])
+            grouped[key][r["mode"]] = r
 
-    for (seq_len, batch_size) in sorted(grouped.keys()):
-        modes = grouped[(seq_len, batch_size)]
-        latencies = {}
-        for m in mode_names:
-            if m in modes:
-                latencies[m] = modes[m]["latency_us"]
+        gqa = num_query_heads // nkv
 
-        cols = " | ".join(
-            f"{latencies[m]:.1f}" if m in latencies else "N/A"
-            for m in mode_names
-        )
+        print("\n" + "=" * 70)
+        print(f"MARKDOWN TABLE  (GQA={gqa}, {num_query_heads}q/{nkv}kv)")
+        print("=" * 70 + "\n")
 
-        baseline_us = latencies.get("baseline", 0)
-        best_mode = min(latencies, key=lambda k: latencies[k]) if latencies else "N/A"
-        best_us = latencies.get(best_mode, 0)
-        speedup = (f"{baseline_us / best_us:.2f}x"
-                   if baseline_us > 0 and best_us > 0 else "N/A")
+        mode_cols = " | ".join(f"{MODES[m]['short']} (us)" for m in mode_names)
+        print(f"| Seq Len | Batch | {mode_cols} | Best | Speedup |")
+        sep_cols = " | ".join("---:" for _ in mode_names)
+        print(f"|---------|-------|{sep_cols}|------|---------|")
 
-        print(f"| {seq_len} | {batch_size} | {cols} | "
-              f"{MODES.get(best_mode, {}).get('short', 'N/A')} | {speedup} |")
+        for (seq_len, batch_size) in sorted(grouped.keys()):
+            modes = grouped[(seq_len, batch_size)]
+            latencies = {}
+            for m in mode_names:
+                if m in modes:
+                    latencies[m] = modes[m]["latency_us"]
+
+            cols = " | ".join(
+                f"{latencies[m]:.1f}" if m in latencies else "N/A"
+                for m in mode_names
+            )
+
+            baseline_us = latencies.get("baseline", 0)
+            best_mode = min(latencies, key=lambda k: latencies[k]) if latencies else "N/A"
+            best_us = latencies.get(best_mode, 0)
+            speedup = (f"{baseline_us / best_us:.2f}x"
+                       if baseline_us > 0 and best_us > 0 else "N/A")
+
+            print(f"| {seq_len} | {batch_size} | {cols} | "
+                  f"{MODES.get(best_mode, {}).get('short', 'N/A')} | {speedup} |")
 
 
 def print_model_comparison_table(data: dict):
@@ -880,8 +892,9 @@ Examples:
         help="Number of query heads (default: 64)",
     )
     kernel_parser.add_argument(
-        "--num-kv-heads", type=int, default=8,
-        help="Number of KV heads (default: 8)",
+        "--num-kv-heads", type=int, nargs="+", default=[8],
+        help="Number of KV heads to test (default: 8). "
+             "Multiple values run separate sweeps, e.g. --num-kv-heads 4 8 12",
     )
     kernel_parser.add_argument(
         "--head-size", type=int, default=128,
@@ -954,23 +967,44 @@ Examples:
         return
 
     if args.command == "kernel":
-        if args.num_query_heads % args.num_kv_heads != 0:
-            kernel_parser.error(
-                "num_query_heads must be divisible by num_kv_heads")
+        for nkv in args.num_kv_heads:
+            if args.num_query_heads % nkv != 0:
+                kernel_parser.error(
+                    f"num_query_heads ({args.num_query_heads}) must be "
+                    f"divisible by num_kv_heads ({nkv})")
 
-        data = run_benchmark_suite(
-            mode_names=args.modes,
-            seq_lengths=args.seq_lengths,
-            batch_sizes=args.batch_sizes,
-            num_runs=args.num_runs,
-            num_query_heads=args.num_query_heads,
-            num_kv_heads=args.num_kv_heads,
-            head_size=args.head_size,
-        )
+        all_data = []
+        for nkv in args.num_kv_heads:
+            data = run_benchmark_suite(
+                mode_names=args.modes,
+                seq_lengths=args.seq_lengths,
+                batch_sizes=args.batch_sizes,
+                num_runs=args.num_runs,
+                num_query_heads=args.num_query_heads,
+                num_kv_heads=nkv,
+                head_size=args.head_size,
+            )
+            all_data.append(data)
+            print_comparison_table(data)
+            if args.markdown:
+                print_markdown_table(data)
 
-        print_comparison_table(data)
-        if args.markdown:
-            print_markdown_table(data)
+        # Merge all KV head runs into one combined dataset
+        if len(all_data) > 1:
+            merged = {
+                "metadata": {
+                    **all_data[0]["metadata"],
+                    "num_kv_heads": args.num_kv_heads,
+                    "gqa_ratios": [args.num_query_heads // nkv
+                                   for nkv in args.num_kv_heads],
+                },
+                "results": [],
+            }
+            for d in all_data:
+                merged["results"].extend(d["results"])
+            data = merged
+        else:
+            data = all_data[0]
 
     elif args.command == "model":
         data = run_model_benchmark_suite(
