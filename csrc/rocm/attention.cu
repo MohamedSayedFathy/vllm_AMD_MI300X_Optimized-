@@ -3360,6 +3360,20 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     default: TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio); break; \
   }
 
+// GQA 1-12 only (for 1024-thread path where GQA 13-16 exceed local memory)
+// Returns false for GQA > 12 so caller can fall back to another path
+#define DISPATCH_GQA_MAX12(LAUNCH_MACRO, handled)                             \
+  handled = true;                                                             \
+  switch (gqa_ratio) {                                                        \
+    case 1:  LAUNCH_MACRO(1);  break; case 2:  LAUNCH_MACRO(2);  break;      \
+    case 3:  LAUNCH_MACRO(3);  break; case 4:  LAUNCH_MACRO(4);  break;      \
+    case 5:  LAUNCH_MACRO(5);  break; case 6:  LAUNCH_MACRO(6);  break;      \
+    case 7:  LAUNCH_MACRO(7);  break; case 8:  LAUNCH_MACRO(8);  break;      \
+    case 9:  LAUNCH_MACRO(9);  break; case 10: LAUNCH_MACRO(10); break;      \
+    case 11: LAUNCH_MACRO(11); break; case 12: LAUNCH_MACRO(12); break;      \
+    default: handled = false; break;                                          \
+  }
+
 // GQA 1-4 use MACRO4, GQA 5-16 use MACRO16 (original mixed dispatch)
 #define DISPATCH_GQA_MIXED(LAUNCH_MACRO4, LAUNCH_MACRO16)                     \
   switch (gqa_ratio) {                                                        \
@@ -3488,29 +3502,39 @@ void paged_attention_custom_launcher(
   if (use_partition_1024) {
     // ---- 1024-token partition path (mfma4 only, NTHR=1024) ----
     // WARNING: 128 VGPRs/wave may cause register spilling
-    constexpr int PARTITION_SIZE = 1024;
-    const int max_num_partitions =
-        DIVIDE_ROUND_UP(max_seq_len, PARTITION_SIZE);
-    constexpr int NTHR = 1024;
-    dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
-    dim3 block(NTHR);
+    // NOTE: GQA ratios 13-16 exceed local memory limit with 1024 threads,
+    //       so they fall back to the 512-partition path below.
+    bool handled = false;
+    if (gqa_ratio <= 12) {
+      constexpr int PARTITION_SIZE = 1024;
+      const int max_num_partitions =
+          DIVIDE_ROUND_UP(max_seq_len, PARTITION_SIZE);
+      constexpr int NTHR = 1024;
+      dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
+      dim3 block(NTHR);
 
-    const bool use_single_partition =
-        (max_num_partitions == 1) && is_fused_short_seq_enabled();
+      const bool use_single_partition =
+          (max_num_partitions == 1) && is_fused_short_seq_enabled();
 
-    if (use_single_partition) {
-      DISPATCH_GQA_ALL(LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE);
-      return;
+      if (use_single_partition) {
+        DISPATCH_GQA_MAX12(LAUNCH_CUSTOM_ATTENTION_MFMA4_SINGLE, handled);
+        if (handled) return;
+      } else {
+        DISPATCH_GQA_MAX12(LAUNCH_CUSTOM_ATTENTION_MFMA4, handled);
+
+        if (handled) {
+          dim3 reduce_grid(num_heads, num_seqs);
+          dim3 reduce_block(head_size);
+          const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
+          DISPATCH_REDUCTION();
+          return;
+        }
+      }
     }
+    // GQA 13-16 fall through to 512-partition path
+  }
 
-    DISPATCH_GQA_ALL(LAUNCH_CUSTOM_ATTENTION_MFMA4);
-
-    dim3 reduce_grid(num_heads, num_seqs);
-    dim3 reduce_block(head_size);
-    const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
-    DISPATCH_REDUCTION();
-
-  } else if (use_partition_512) {
+  if (use_partition_512 || (use_partition_1024 && gqa_ratio > 12)) {
     // ---- 512-token partition path (mfma4 only, NTHR=512) ----
     constexpr int PARTITION_SIZE = 512;
     const int max_num_partitions =
