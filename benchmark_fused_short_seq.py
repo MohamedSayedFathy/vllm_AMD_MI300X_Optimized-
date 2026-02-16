@@ -3,10 +3,11 @@
 """
 Benchmark Runner for PagedAttention Kernel Optimizations (AMD MI300X)
 
-Three benchmark types:
-  kernel     - Raw kernel latency (microseconds), no model needed
-  model      - End-to-end inference latency with a real model (seconds)
-  throughput - Real-dataset throughput (req/s, tok/s) with ShareGPT/sonnet
+Four benchmark types:
+  kernel        - Raw kernel latency (microseconds), no model needed
+  model         - End-to-end inference latency with a real model (seconds)
+  throughput    - Real-dataset throughput (req/s, tok/s) with ShareGPT/sonnet
+  latency_sweep - Latency vs batch size scaling (1, 4, 8, 16, 32, 64)
 
 Compares 5 kernel modes:
   1. baseline       - Original 2-kernel path (QKV + reduce always)
@@ -574,7 +575,7 @@ def run_single_throughput_benchmark(
     model: str,
     dataset_name: str,
     dataset_path: str,
-    num_prompts: int = 100,
+    num_prompts: int = 500,
     dtype: str = "half",
     max_model_len: int = 4096,
     enforce_eager: bool = True,
@@ -665,7 +666,7 @@ def run_throughput_benchmark_suite(
     models: list,
     dataset_name: str,
     dataset_path: str,
-    num_prompts: int = 100,
+    num_prompts: int = 500,
     dtype: str = "half",
     max_model_len: int = 4096,
     enforce_eager: bool = True,
@@ -886,6 +887,302 @@ def print_throughput_markdown_table(data: dict):
                       f"{elapsed:.2f} | {speedup} |")
             else:
                 print(f"| {MODES[m]['short']} | FAILED | | | |")
+
+
+# ============================================================================
+# Latency Sweep (Batch Size + Sequence Length Scaling) Benchmark
+# ============================================================================
+
+def run_latency_sweep_suite(
+    mode_names: list,
+    models: list,
+    batch_sizes: list,
+    input_lens: list,
+    output_lens: list,
+    num_iters: int = 10,
+    dtype: str = "half",
+    max_model_len: int = 16384,
+    enforce_eager: bool = True,
+) -> dict:
+    """Run latency benchmark across batch sizes, input lengths, and output lengths.
+
+    Produces key charts for presentations:
+    1. Batch size scaling: how latency changes as concurrent users increase
+    2. Sequence length scaling: how latency changes with longer contexts
+    3. Output length scaling: how decode latency compounds over longer generations
+    """
+    total = (len(models) * len(input_lens) * len(output_lens)
+             * len(batch_sizes) * len(mode_names))
+    current = 0
+
+    vllm_dir = os.path.dirname(os.path.abspath(__file__))
+    git_info = get_git_info(vllm_dir)
+
+    print("\n" + "=" * 80)
+    print("Latency Sweep Benchmark (AMD MI300X)")
+    print("=" * 80)
+    print(f"\nConfiguration:")
+    print(f"  Branch:            {git_info['branch']} ({git_info['commit']})")
+    print(f"  Models:            {models}")
+    print(f"  Modes:             {mode_names}")
+    print(f"  Batch sizes:       {batch_sizes}")
+    print(f"  Input lengths:     {input_lens}")
+    print(f"  Output lengths:    {output_lens}")
+    print(f"  Iterations:        {num_iters}")
+    print(f"  Dtype:             {dtype}")
+    print(f"  Max model len:     {max_model_len}")
+    print(f"  Enforce eager:     {enforce_eager}")
+    print(f"  Total benchmarks:  {total}")
+    print("-" * 80)
+
+    results = []
+
+    for model in models:
+        profile_info = ""
+        for pval in MODEL_PROFILES.values():
+            if pval["name"] == model:
+                profile_info = (f" (GQA={pval['gqa_ratio']}, "
+                                f"{pval['query_heads']}q/{pval['kv_heads']}kv)")
+                break
+
+        print(f"\n{'=' * 80}")
+        print(f"Model: {model}{profile_info}")
+        print(f"{'=' * 80}")
+
+        for input_len in input_lens:
+            for output_len in output_lens:
+                for bs in batch_sizes:
+                    print(f"\n--- input_len={input_len}, output_len={output_len}, "
+                          f"batch_size={bs} ---")
+
+                    for mode_name in mode_names:
+                        current += 1
+                        mode = MODES[mode_name]
+                        fused = is_fused_active(mode_name, input_len)
+                        tag = " [FUSED]" if fused else ""
+
+                        print(f"  [{current}/{total}] {mode['short']:<12}{tag}",
+                              end="", flush=True)
+
+                        res = run_single_model_benchmark(
+                            mode_name, model, input_len, output_len,
+                            bs, num_iters, dtype, max_model_len,
+                            enforce_eager,
+                        )
+
+                        avg = res["avg_latency"]
+                        if avg > 0:
+                            print(f"  -> {avg:.4f}s ({avg*1000:.1f}ms)")
+                        else:
+                            print(f"  -> FAILED")
+
+                        results.append({
+                            "mode": mode_name,
+                            "mode_label": mode["short"],
+                            "model": model,
+                            "batch_size": bs,
+                            "input_len": input_len,
+                            "output_len": output_len,
+                            "avg_latency_s": round(avg, 6),
+                            "avg_latency_ms": round(avg * 1000, 2),
+                            "percentiles": res["percentiles"],
+                            "fused_active": fused,
+                            "partition_size": mode["partition_size"],
+                        })
+
+    data = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "benchmark_type": "latency_sweep",
+            "git_branch": git_info["branch"],
+            "git_commit": git_info["commit"],
+            "models": models,
+            "modes": mode_names,
+            "batch_sizes": batch_sizes,
+            "input_lens": input_lens,
+            "output_lens": output_lens,
+            "num_iters": num_iters,
+            "dtype": dtype,
+            "max_model_len": max_model_len,
+            "enforce_eager": enforce_eager,
+        },
+        "results": results,
+    }
+
+    return data
+
+
+def print_latency_sweep_table(data: dict):
+    """Print latency sweep results grouped by input/output length."""
+
+    results = data["results"]
+    mode_names = data["metadata"]["modes"]
+    if not results:
+        print("No results to display.")
+        return
+
+    from collections import defaultdict
+
+    seen = []
+    for r in results:
+        if r["model"] not in seen:
+            seen.append(r["model"])
+
+    for model in seen:
+        model_results = [r for r in results if r["model"] == model]
+
+        profile_info = ""
+        for pval in MODEL_PROFILES.values():
+            if pval["name"] == model:
+                profile_info = (f"  GQA={pval['gqa_ratio']} "
+                                f"({pval['query_heads']}q/{pval['kv_heads']}kv)")
+                break
+
+        # Group by (input_len, output_len, batch_size)
+        grouped = defaultdict(dict)
+        for r in model_results:
+            grouped[(r["input_len"], r["output_len"], r["batch_size"])][r["mode"]] = r
+
+        print("\n" + "=" * (46 + 16 * len(mode_names)))
+        print(f"LATENCY SWEEP")
+        print("=" * (46 + 16 * len(mode_names)))
+        print(f"  Model: {model}{profile_info}")
+        print(f"  Branch: {data['metadata'].get('git_branch', '?')} "
+              f"({data['metadata'].get('git_commit', '?')})")
+
+        mode_headers = "".join(
+            f" {'':>1}{MODES[m]['short']:>11}ms" for m in mode_names
+        )
+        print(f"\n{'In Len':>7} {'Out':>5} {'Batch':>6} |{mode_headers} | "
+              f"{'Best':>10} {'vs Base':>8}")
+        print("-" * (46 + 16 * len(mode_names)))
+
+        for (input_len, output_len, bs) in sorted(grouped.keys()):
+            modes = grouped[(input_len, output_len, bs)]
+            latencies = {}
+            for m in mode_names:
+                if m in modes and modes[m]["avg_latency_ms"] > 0:
+                    latencies[m] = modes[m]["avg_latency_ms"]
+
+            if not latencies:
+                continue
+
+            baseline_ms = latencies.get("baseline", 0)
+
+            cols = ""
+            for m in mode_names:
+                if m in latencies:
+                    val = latencies[m]
+                    fused = modes[m].get("fused_active", False)
+                    marker = "*" if fused else " "
+                    cols += f" {marker}{val:>10.1f}ms"
+                else:
+                    cols += f"  {'N/A':>10}  "
+
+            best_mode = min(latencies, key=lambda k: latencies[k])
+            best_ms = latencies[best_mode]
+            if baseline_ms > 0:
+                speedup = baseline_ms / best_ms
+                speedup_str = f"{speedup:.2f}x"
+            else:
+                speedup_str = "N/A"
+
+            print(f"{input_len:>7} {output_len:>5} {bs:>6} |{cols} | "
+                  f"{MODES[best_mode]['short']:>10} {speedup_str:>8}")
+
+        print("-" * (46 + 16 * len(mode_names)))
+        print("  * = fused (single-partition) path active")
+
+        # Per-mode summary
+        if "baseline" in mode_names and len(mode_names) > 1:
+            print(f"\nSpeedup summary vs baseline:")
+            for m in mode_names:
+                if m == "baseline":
+                    continue
+                speedups = []
+                for key, modes in grouped.items():
+                    if "baseline" in modes and m in modes:
+                        b = modes["baseline"]["avg_latency_ms"]
+                        o = modes[m]["avg_latency_ms"]
+                        if b > 0 and o > 0:
+                            speedups.append(b / o)
+                if speedups:
+                    avg_sp = sum(speedups) / len(speedups)
+                    max_sp = max(speedups)
+                    min_sp = min(speedups)
+                    print(f"  {MODES[m]['short']:<14}: "
+                          f"avg {avg_sp:.3f}x, "
+                          f"best {max_sp:.3f}x, "
+                          f"worst {min_sp:.3f}x")
+
+
+def print_latency_sweep_markdown(data: dict):
+    """Print latency sweep results in markdown format."""
+
+    results = data["results"]
+    mode_names = data["metadata"]["modes"]
+    if not results:
+        return
+
+    from collections import defaultdict
+
+    seen = []
+    for r in results:
+        if r["model"] not in seen:
+            seen.append(r["model"])
+
+    for model in seen:
+        model_results = [r for r in results if r["model"] == model]
+
+        profile_info = ""
+        for pval in MODEL_PROFILES.values():
+            if pval["name"] == model:
+                profile_info = f" (GQA={pval['gqa_ratio']})"
+                break
+
+        grouped = defaultdict(dict)
+        for r in model_results:
+            grouped[(r["input_len"], r["output_len"], r["batch_size"])][r["mode"]] = r
+
+        short_name = model.split("/")[-1]
+        print("\n" + "=" * 70)
+        print(f"MARKDOWN TABLE: {short_name}{profile_info} - Latency Sweep")
+        print("=" * 70 + "\n")
+
+        mode_cols = " | ".join(f"{MODES[m]['short']} (ms)" for m in mode_names)
+        print(f"| In Len | Out Len | Batch | {mode_cols} | Best | Speedup |")
+        sep_cols = " | ".join("---:" for _ in mode_names)
+        print(f"|-------:|--------:|------:|{sep_cols}|------|---------|")
+
+        for (input_len, output_len, bs) in sorted(grouped.keys()):
+            modes = grouped[(input_len, output_len, bs)]
+            latencies = {}
+            for m in mode_names:
+                if m in modes and modes[m]["avg_latency_ms"] > 0:
+                    latencies[m] = modes[m]["avg_latency_ms"]
+
+            if not latencies:
+                continue
+
+            baseline_ms = latencies.get("baseline", 0)
+
+            cols_parts = []
+            for m in mode_names:
+                if m in latencies:
+                    fused = modes[m].get("fused_active", False)
+                    marker = "*" if fused else ""
+                    cols_parts.append(f"{latencies[m]:.1f}{marker}")
+                else:
+                    cols_parts.append("N/A")
+            cols_str = " | ".join(cols_parts)
+
+            best_mode = min(latencies, key=lambda k: latencies[k])
+            best_ms = latencies[best_mode]
+            speedup = (f"{baseline_ms / best_ms:.2f}x"
+                       if baseline_ms > 0 else "N/A")
+
+            print(f"| {input_len} | {output_len} | {bs} | {cols_str} | "
+                  f"{MODES[best_mode]['short']} | {speedup} |")
 
 
 # ============================================================================
@@ -1418,8 +1715,8 @@ Examples:
              "(e.g. ShareGPT_V3_unfiltered_cleaned_split.json)",
     )
     tp_parser.add_argument(
-        "--num-prompts", type=int, default=100,
-        help="Number of prompts to process (default: 100)",
+        "--num-prompts", type=int, default=500,
+        help="Number of prompts to process (default: 500)",
     )
     tp_parser.add_argument(
         "--dtype", type=str, default="half",
@@ -1427,10 +1724,61 @@ Examples:
         help="Data type (default: half)",
     )
     tp_parser.add_argument(
-        "--max-model-len", type=int, default=4096,
+        "--max-model-len", type=int, default=12000,
         help="Max model context length (default: 4096)",
     )
     tp_parser.add_argument(
+        "--no-enforce-eager", action="store_true",
+        help="Disable --enforce-eager (default: enforce-eager is ON)",
+    )
+
+    # --- latency_sweep subcommand ---
+    ls_parser = subparsers.add_parser(
+        "latency_sweep",
+        help="Latency vs batch size scaling benchmark",
+    )
+    add_common_args(ls_parser)
+
+    ls_model_group = ls_parser.add_mutually_exclusive_group(required=True)
+    ls_model_group.add_argument(
+        "--model", type=str, nargs="+",
+        help="HuggingFace model name(s)",
+    )
+    ls_model_group.add_argument(
+        "--preset", type=str, nargs="+",
+        choices=profile_keys + ["all"],
+        help="Predefined model profile(s), or 'all'",
+    )
+
+    ls_parser.add_argument(
+        "--batch-sizes", type=int, nargs="+",
+        default=[1, 4, 8, 16, 32, 64],
+        help="Batch sizes to sweep (default: 1 4 8 16 32 64)",
+    )
+    ls_parser.add_argument(
+        "--input-lens", type=int, nargs="+",
+        default=[500, 1000, 4000, 8000, 12000],
+        help="Input lengths to sweep (default: 500 1000 4000 8000 12000)",
+    )
+    ls_parser.add_argument(
+        "--output-lens", type=int, nargs="+",
+        default=[64, 256, 512],
+        help="Output lengths to sweep (default: 64 256 512)",
+    )
+    ls_parser.add_argument(
+        "--num-iters", type=int, default=10,
+        help="Number of iterations per config (default: 10)",
+    )
+    ls_parser.add_argument(
+        "--dtype", type=str, default="half",
+        choices=["half", "bfloat16", "float"],
+        help="Data type (default: half)",
+    )
+    ls_parser.add_argument(
+        "--max-model-len", type=int, default=16384,
+        help="Max model context length (default: 16384)",
+    )
+    ls_parser.add_argument(
         "--no-enforce-eager", action="store_true",
         help="Disable --enforce-eager (default: enforce-eager is ON)",
     )
@@ -1452,6 +1800,10 @@ Examples:
             print_throughput_comparison_table(data)
             if md:
                 print_throughput_markdown_table(data)
+        elif btype == "latency_sweep":
+            print_latency_sweep_table(data)
+            if md:
+                print_latency_sweep_markdown(data)
         else:
             print_comparison_table(data)
             if md:
@@ -1461,11 +1813,13 @@ Examples:
     # Default to kernel if no subcommand given
     if args.command is None:
         parser.print_help()
-        print("\nHint: use 'kernel', 'model', or 'throughput' subcommand. Examples:")
+        print("\nHint: use 'kernel', 'model', 'throughput', or "
+              "'latency_sweep' subcommand. Examples:")
         print("  python benchmark_fused_short_seq.py kernel")
         print("  python benchmark_fused_short_seq.py model --preset all")
         print("  python benchmark_fused_short_seq.py throughput --preset all "
               "--dataset-path ShareGPT_V3_unfiltered_cleaned_split.json")
+        print("  python benchmark_fused_short_seq.py latency_sweep --preset all")
         return
 
     if args.command == "kernel":
@@ -1560,6 +1914,33 @@ Examples:
         print_throughput_comparison_table(data)
         if args.markdown:
             print_throughput_markdown_table(data)
+
+    elif args.command == "latency_sweep":
+        # Resolve model list from --model or --preset
+        if args.preset:
+            if "all" in args.preset:
+                presets = list(MODEL_PROFILES.keys())
+            else:
+                presets = args.preset
+            models = [MODEL_PROFILES[p]["name"] for p in presets]
+        else:
+            models = args.model
+
+        data = run_latency_sweep_suite(
+            mode_names=args.modes,
+            models=models,
+            batch_sizes=args.batch_sizes,
+            input_lens=args.input_lens,
+            output_lens=args.output_lens,
+            num_iters=args.num_iters,
+            dtype=args.dtype,
+            max_model_len=args.max_model_len,
+            enforce_eager=not args.no_enforce_eager,
+        )
+
+        print_latency_sweep_table(data)
+        if args.markdown:
+            print_latency_sweep_markdown(data)
 
     else:
         return
