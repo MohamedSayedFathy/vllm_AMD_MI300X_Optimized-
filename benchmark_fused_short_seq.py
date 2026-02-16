@@ -3,9 +3,10 @@
 """
 Benchmark Runner for PagedAttention Kernel Optimizations (AMD MI300X)
 
-Two benchmark types:
-  kernel  - Raw kernel latency (microseconds), no model needed
-  model   - End-to-end inference latency with a real model (seconds)
+Three benchmark types:
+  kernel     - Raw kernel latency (microseconds), no model needed
+  model      - End-to-end inference latency with a real model (seconds)
+  throughput - Real-dataset throughput (req/s, tok/s) with ShareGPT/sonnet
 
 Compares 5 kernel modes:
   1. baseline       - Original 2-kernel path (QKV + reduce always)
@@ -46,6 +47,17 @@ Usage:
         --preset llama3-8b \
         --input-lens 64 128 256 512 \
         --output-len 64 --batch-size 32
+
+    # === THROUGHPUT BENCHMARK (real conversations) ===
+    # Test all models with ShareGPT dataset
+    python benchmark_fused_short_seq.py throughput --preset all \
+        --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json
+
+    # Specific model with sonnet dataset
+    python benchmark_fused_short_seq.py throughput \
+        --preset llama3-8b \
+        --dataset-name sonnet \
+        --dataset-path vllm/benchmarks/sonnet.txt
 
     # === COMMON OPTIONS ===
     # Include markdown table
@@ -554,6 +566,329 @@ def run_model_benchmark_suite(
 
 
 # ============================================================================
+# Throughput (Real Dataset) Benchmark
+# ============================================================================
+
+def run_single_throughput_benchmark(
+    mode_name: str,
+    model: str,
+    dataset_name: str,
+    dataset_path: str,
+    num_prompts: int = 100,
+    dtype: str = "half",
+    max_model_len: int = 4096,
+    enforce_eager: bool = True,
+) -> dict:
+    """Run vllm bench throughput for a given mode.
+
+    Returns dict with requests_per_second, tokens_per_second, etc.
+    """
+    mode = MODES[mode_name]
+
+    env = os.environ.copy()
+    env.update(mode["env"])
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    tmp.close()
+
+    cmd = [
+        sys.executable, "-m", "vllm.entrypoints.cli.main",
+        "bench", "throughput",
+        "--model", model,
+        "--dataset-name", dataset_name,
+        "--dataset-path", dataset_path,
+        "--num-prompts", str(num_prompts),
+        "--dtype", dtype,
+        "--max-model-len", str(max_model_len),
+        "--output-json", tmp.name,
+    ]
+    if enforce_eager:
+        cmd.append("--enforce-eager")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,  # 15 min timeout
+        )
+
+        if os.path.exists(tmp.name) and os.path.getsize(tmp.name) > 0:
+            with open(tmp.name) as f:
+                data = json.load(f)
+            return {
+                "requests_per_second": data.get("requests_per_second", 0),
+                "tokens_per_second": data.get("tokens_per_second", 0),
+                "elapsed_time": data.get("elapsed_time", 0),
+                "num_requests": data.get("num_requests", 0),
+                "total_num_tokens": data.get("total_num_tokens", 0),
+            }
+
+        # Fallback: parse stdout
+        match = re.search(
+            r"Throughput:\s+([\d.]+)\s+requests/s,\s+([\d.]+)\s+total tokens/s",
+            result.stdout,
+        )
+        if match:
+            return {
+                "requests_per_second": float(match.group(1)),
+                "tokens_per_second": float(match.group(2)),
+                "elapsed_time": 0,
+                "num_requests": num_prompts,
+                "total_num_tokens": 0,
+            }
+
+        print(f"    Warning: Could not parse output")
+        if result.stderr:
+            lines = result.stderr.strip().split("\n")
+            for line in lines[-3:]:
+                print(f"    stderr: {line[:150]}")
+        return {"requests_per_second": 0, "tokens_per_second": 0,
+                "elapsed_time": 0, "num_requests": 0, "total_num_tokens": 0}
+
+    except subprocess.TimeoutExpired:
+        print(f"    Warning: Timed out after 900s")
+        return {"requests_per_second": 0, "tokens_per_second": 0,
+                "elapsed_time": 0, "num_requests": 0, "total_num_tokens": 0}
+    except Exception as e:
+        print(f"    Error: {e}")
+        return {"requests_per_second": 0, "tokens_per_second": 0,
+                "elapsed_time": 0, "num_requests": 0, "total_num_tokens": 0}
+    finally:
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+
+
+def run_throughput_benchmark_suite(
+    mode_names: list,
+    models: list,
+    dataset_name: str,
+    dataset_path: str,
+    num_prompts: int = 100,
+    dtype: str = "half",
+    max_model_len: int = 4096,
+    enforce_eager: bool = True,
+) -> dict:
+    """Run throughput benchmark across all models and modes."""
+
+    total = len(models) * len(mode_names)
+    current = 0
+
+    vllm_dir = os.path.dirname(os.path.abspath(__file__))
+    git_info = get_git_info(vllm_dir)
+
+    print("\n" + "=" * 80)
+    print("Throughput Benchmark (AMD MI300X) - Real Dataset")
+    print("=" * 80)
+    print(f"\nConfiguration:")
+    print(f"  Branch:            {git_info['branch']} ({git_info['commit']})")
+    print(f"  Models:            {models}")
+    print(f"  Modes:             {mode_names}")
+    print(f"  Dataset:           {dataset_name} ({dataset_path})")
+    print(f"  Num prompts:       {num_prompts}")
+    print(f"  Dtype:             {dtype}")
+    print(f"  Max model len:     {max_model_len}")
+    print(f"  Enforce eager:     {enforce_eager}")
+    print(f"  Total benchmarks:  {total}")
+    print("-" * 80)
+
+    results = []
+
+    for model in models:
+        profile_info = ""
+        for pval in MODEL_PROFILES.values():
+            if pval["name"] == model:
+                profile_info = (f" (GQA={pval['gqa_ratio']}, "
+                                f"{pval['query_heads']}q/{pval['kv_heads']}kv)")
+                break
+
+        print(f"\n{'=' * 80}")
+        print(f"Model: {model}{profile_info}")
+        print(f"{'=' * 80}")
+
+        for mode_name in mode_names:
+            current += 1
+            mode = MODES[mode_name]
+
+            print(f"  [{current}/{total}] {mode['short']:<12}",
+                  end="", flush=True)
+
+            res = run_single_throughput_benchmark(
+                mode_name, model, dataset_name, dataset_path,
+                num_prompts, dtype, max_model_len, enforce_eager,
+            )
+
+            rps = res["requests_per_second"]
+            tps = res["tokens_per_second"]
+            if rps > 0:
+                print(f"  -> {rps:.2f} req/s, {tps:.1f} tok/s")
+            else:
+                print(f"  -> FAILED")
+
+            results.append({
+                "mode": mode_name,
+                "mode_label": mode["short"],
+                "model": model,
+                "requests_per_second": round(rps, 2),
+                "tokens_per_second": round(tps, 1),
+                "elapsed_time": round(res["elapsed_time"], 2),
+                "num_requests": res["num_requests"],
+                "total_num_tokens": res["total_num_tokens"],
+            })
+
+    data = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "benchmark_type": "throughput",
+            "git_branch": git_info["branch"],
+            "git_commit": git_info["commit"],
+            "models": models,
+            "modes": mode_names,
+            "dataset_name": dataset_name,
+            "dataset_path": dataset_path,
+            "num_prompts": num_prompts,
+            "dtype": dtype,
+            "max_model_len": max_model_len,
+            "enforce_eager": enforce_eager,
+        },
+        "results": results,
+    }
+
+    return data
+
+
+def print_throughput_comparison_table(data: dict):
+    """Print throughput comparison grouped by model."""
+
+    results = data["results"]
+    mode_names = data["metadata"]["modes"]
+    if not results:
+        print("No results to display.")
+        return
+
+    # Preserve model order
+    seen = []
+    for r in results:
+        if r["model"] not in seen:
+            seen.append(r["model"])
+    model_list = seen
+
+    for model in model_list:
+        model_results = [r for r in results if r["model"] == model]
+
+        profile_info = ""
+        for pval in MODEL_PROFILES.values():
+            if pval["name"] == model:
+                profile_info = (f"  GQA={pval['gqa_ratio']} "
+                                f"({pval['query_heads']}q/{pval['kv_heads']}kv)")
+                break
+
+        print("\n" + "=" * 80)
+        print(f"THROUGHPUT COMPARISON")
+        print("=" * 80)
+        print(f"  Model: {model}{profile_info}")
+        print(f"  Dataset: {data['metadata']['dataset_name']}")
+        print(f"  Prompts: {data['metadata']['num_prompts']}")
+        print(f"  Branch: {data['metadata'].get('git_branch', '?')} "
+              f"({data['metadata'].get('git_commit', '?')})")
+
+        print(f"\n{'Mode':<16} | {'req/s':>8} | {'tok/s':>10} | "
+              f"{'Time (s)':>9} | {'vs Base':>8}")
+        print("-" * 65)
+
+        mode_data = {}
+        for r in model_results:
+            mode_data[r["mode"]] = r
+
+        baseline_rps = mode_data.get("baseline", {}).get(
+            "requests_per_second", 0)
+
+        for m in mode_names:
+            if m not in mode_data:
+                continue
+            r = mode_data[m]
+            rps = r["requests_per_second"]
+            tps = r["tokens_per_second"]
+            elapsed = r["elapsed_time"]
+
+            if rps > 0:
+                if baseline_rps > 0:
+                    speedup = f"{rps / baseline_rps:.2f}x"
+                else:
+                    speedup = "N/A"
+                print(f"  {MODES[m]['short']:<14} | {rps:>8.2f} | {tps:>10.1f} | "
+                      f"{elapsed:>9.2f} | {speedup:>8}")
+            else:
+                print(f"  {MODES[m]['short']:<14} | {'FAILED':>8} | "
+                      f"{'':>10} | {'':>9} | {'':>8}")
+
+        print("-" * 65)
+
+        # Best mode
+        valid = [r for r in model_results if r["requests_per_second"] > 0]
+        if valid:
+            best = max(valid, key=lambda r: r["requests_per_second"])
+            print(f"  Best: {MODES[best['mode']]['short']} "
+                  f"({best['requests_per_second']:.2f} req/s, "
+                  f"{best['tokens_per_second']:.1f} tok/s)")
+
+
+def print_throughput_markdown_table(data: dict):
+    """Print throughput results in markdown format."""
+
+    results = data["results"]
+    mode_names = data["metadata"]["modes"]
+    if not results:
+        return
+
+    seen = []
+    for r in results:
+        if r["model"] not in seen:
+            seen.append(r["model"])
+
+    for model in seen:
+        model_results = [r for r in results if r["model"] == model]
+
+        profile_info = ""
+        for pval in MODEL_PROFILES.values():
+            if pval["name"] == model:
+                profile_info = f" (GQA={pval['gqa_ratio']})"
+                break
+
+        short_name = model.split("/")[-1]
+        print("\n" + "=" * 70)
+        print(f"MARKDOWN TABLE: {short_name}{profile_info} - Throughput")
+        print("=" * 70 + "\n")
+
+        print(f"| Mode | req/s | tok/s | Time (s) | vs Baseline |")
+        print(f"|------|------:|------:|---------:|------------:|")
+
+        mode_data = {}
+        for r in model_results:
+            mode_data[r["mode"]] = r
+
+        baseline_rps = mode_data.get("baseline", {}).get(
+            "requests_per_second", 0)
+
+        for m in mode_names:
+            if m not in mode_data:
+                continue
+            r = mode_data[m]
+            rps = r["requests_per_second"]
+            tps = r["tokens_per_second"]
+            elapsed = r["elapsed_time"]
+
+            if rps > 0:
+                speedup = (f"{rps / baseline_rps:.2f}x"
+                           if baseline_rps > 0 else "N/A")
+                print(f"| {MODES[m]['short']} | {rps:.2f} | {tps:.1f} | "
+                      f"{elapsed:.2f} | {speedup} |")
+            else:
+                print(f"| {MODES[m]['short']} | FAILED | | | |")
+
+
+# ============================================================================
 # Output
 # ============================================================================
 
@@ -1054,6 +1389,52 @@ Examples:
         help="Disable --enforce-eager (default: enforce-eager is ON)",
     )
 
+    # --- throughput subcommand ---
+    tp_parser = subparsers.add_parser(
+        "throughput",
+        help="Real-dataset throughput benchmark (req/s, tok/s)",
+    )
+    add_common_args(tp_parser)
+
+    tp_model_group = tp_parser.add_mutually_exclusive_group(required=True)
+    tp_model_group.add_argument(
+        "--model", type=str, nargs="+",
+        help="HuggingFace model name(s)",
+    )
+    tp_model_group.add_argument(
+        "--preset", type=str, nargs="+",
+        choices=profile_keys + ["all"],
+        help="Predefined model profile(s), or 'all'",
+    )
+
+    tp_parser.add_argument(
+        "--dataset-name", type=str, default="sharegpt",
+        choices=["sharegpt", "sonnet"],
+        help="Dataset type (default: sharegpt)",
+    )
+    tp_parser.add_argument(
+        "--dataset-path", type=str, required=True,
+        help="Path to dataset file "
+             "(e.g. ShareGPT_V3_unfiltered_cleaned_split.json)",
+    )
+    tp_parser.add_argument(
+        "--num-prompts", type=int, default=100,
+        help="Number of prompts to process (default: 100)",
+    )
+    tp_parser.add_argument(
+        "--dtype", type=str, default="half",
+        choices=["half", "bfloat16", "float"],
+        help="Data type (default: half)",
+    )
+    tp_parser.add_argument(
+        "--max-model-len", type=int, default=4096,
+        help="Max model context length (default: 4096)",
+    )
+    tp_parser.add_argument(
+        "--no-enforce-eager", action="store_true",
+        help="Disable --enforce-eager (default: enforce-eager is ON)",
+    )
+
     args = parser.parse_args()
 
     # Load mode: display saved results (works without subcommand)
@@ -1062,23 +1443,29 @@ Examples:
             data = json.load(f)
         print(f"Loaded results from: {args.load}")
         btype = data.get("metadata", {}).get("benchmark_type", "kernel")
+        md = args.markdown if hasattr(args, "markdown") else False
         if btype == "model":
             print_model_comparison_table(data)
-            if args.markdown if hasattr(args, "markdown") else False:
+            if md:
                 print_model_markdown_table(data)
+        elif btype == "throughput":
+            print_throughput_comparison_table(data)
+            if md:
+                print_throughput_markdown_table(data)
         else:
             print_comparison_table(data)
-            if args.markdown if hasattr(args, "markdown") else False:
+            if md:
                 print_markdown_table(data)
         return
 
     # Default to kernel if no subcommand given
     if args.command is None:
         parser.print_help()
-        print("\nHint: use 'kernel' or 'model' subcommand. Examples:")
+        print("\nHint: use 'kernel', 'model', or 'throughput' subcommand. Examples:")
         print("  python benchmark_fused_short_seq.py kernel")
-        print("  python benchmark_fused_short_seq.py model "
-              "--model meta-llama/Llama-3.1-8B-Instruct")
+        print("  python benchmark_fused_short_seq.py model --preset all")
+        print("  python benchmark_fused_short_seq.py throughput --preset all "
+              "--dataset-path ShareGPT_V3_unfiltered_cleaned_split.json")
         return
 
     if args.command == "kernel":
@@ -1147,6 +1534,32 @@ Examples:
         print_model_comparison_table(data)
         if args.markdown:
             print_model_markdown_table(data)
+
+    elif args.command == "throughput":
+        # Resolve model list from --model or --preset
+        if args.preset:
+            if "all" in args.preset:
+                presets = list(MODEL_PROFILES.keys())
+            else:
+                presets = args.preset
+            models = [MODEL_PROFILES[p]["name"] for p in presets]
+        else:
+            models = args.model
+
+        data = run_throughput_benchmark_suite(
+            mode_names=args.modes,
+            models=models,
+            dataset_name=args.dataset_name,
+            dataset_path=args.dataset_path,
+            num_prompts=args.num_prompts,
+            dtype=args.dtype,
+            max_model_len=args.max_model_len,
+            enforce_eager=not args.no_enforce_eager,
+        )
+
+        print_throughput_comparison_table(data)
+        if args.markdown:
+            print_throughput_markdown_table(data)
 
     else:
         return
