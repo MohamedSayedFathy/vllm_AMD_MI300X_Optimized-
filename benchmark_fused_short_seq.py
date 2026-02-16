@@ -30,19 +30,22 @@ Usage:
         --batch-sizes 16 32
 
     # === MODEL BENCHMARK ===
+    # Test all predefined models (GQA=4 and GQA=7)
+    python benchmark_fused_short_seq.py model --preset all
+
+    # Test specific presets
+    python benchmark_fused_short_seq.py model --preset llama3-8b qwen2-7b
+
+    # Test custom model(s)
     python benchmark_fused_short_seq.py model \
-        --model meta-llama/Llama-3.1-8B-Instruct
+        --model Qwen/Qwen2.5-7B-Instruct \
+               NousResearch/Hermes-3-Llama-3.1-8B
 
     # Model benchmark with custom configs
     python benchmark_fused_short_seq.py model \
-        --model meta-llama/Llama-3.1-8B-Instruct \
+        --preset llama3-8b \
         --input-lens 64 128 256 512 \
         --output-len 64 --batch-size 32
-
-    # Compare only baseline vs best mode on model
-    python benchmark_fused_short_seq.py model \
-        --model meta-llama/Llama-3.1-8B-Instruct \
-        --modes baseline mfma4_all_512
 
     # === COMMON OPTIONS ===
     # Include markdown table
@@ -60,6 +63,35 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime
+
+
+# ============================================================================
+# Model profiles: well-known models with their GQA configurations
+# ============================================================================
+
+MODEL_PROFILES = {
+    "llama3-8b": {
+        "name": "NousResearch/Hermes-3-Llama-3.1-8B",
+        "description": "Llama-3.1 8B (GQA=4, 32q/8kv)",
+        "gqa_ratio": 4,
+        "query_heads": 32,
+        "kv_heads": 8,
+    },
+    "qwen2-7b": {
+        "name": "Qwen/Qwen2.5-7B-Instruct",
+        "description": "Qwen2.5 7B (GQA=7, 28q/4kv)",
+        "gqa_ratio": 7,
+        "query_heads": 28,
+        "kv_heads": 4,
+    },
+    "mistral-7b": {
+        "name": "mistralai/Mistral-7B-Instruct-v0.3",
+        "description": "Mistral 7B v0.3 (GQA=4, 32q/8kv)",
+        "gqa_ratio": 4,
+        "query_heads": 32,
+        "kv_heads": 8,
+    },
+}
 
 
 # ============================================================================
@@ -338,6 +370,7 @@ def run_single_model_benchmark(
     num_iters: int = 10,
     dtype: str = "half",
     max_model_len: int = 4096,
+    enforce_eager: bool = True,
 ) -> dict:
     """Run vllm bench latency for a given mode.
 
@@ -365,6 +398,8 @@ def run_single_model_benchmark(
         "--max-model-len", str(max_model_len),
         "--output-json", tmp.name,
     ]
+    if enforce_eager:
+        cmd.append("--enforce-eager")
 
     try:
         result = subprocess.run(
@@ -408,17 +443,18 @@ def run_single_model_benchmark(
 
 def run_model_benchmark_suite(
     mode_names: list,
-    model: str,
+    models: list,
     input_lens: list,
     output_len: int = 64,
     batch_size: int = 32,
     num_iters: int = 10,
     dtype: str = "half",
     max_model_len: int = 4096,
+    enforce_eager: bool = True,
 ) -> dict:
-    """Run model latency benchmark across all modes and input lengths."""
+    """Run model latency benchmark across all models, modes, and input lengths."""
 
-    total = len(input_lens) * len(mode_names)
+    total = len(models) * len(input_lens) * len(mode_names)
     current = 0
 
     vllm_dir = os.path.dirname(os.path.abspath(__file__))
@@ -429,7 +465,7 @@ def run_model_benchmark_suite(
     print("=" * 80)
     print(f"\nConfiguration:")
     print(f"  Branch:            {git_info['branch']} ({git_info['commit']})")
-    print(f"  Model:             {model}")
+    print(f"  Models:            {models}")
     print(f"  Modes:             {mode_names}")
     print(f"  Input lengths:     {input_lens}")
     print(f"  Output length:     {output_len}")
@@ -437,47 +473,63 @@ def run_model_benchmark_suite(
     print(f"  Iterations:        {num_iters}")
     print(f"  Dtype:             {dtype}")
     print(f"  Max model len:     {max_model_len}")
+    print(f"  Enforce eager:     {enforce_eager}")
     print(f"  Total benchmarks:  {total}")
     print("-" * 80)
 
     results = []
 
-    for input_len in input_lens:
-        print(f"\n--- input_len={input_len}, output_len={output_len}, "
-              f"batch_size={batch_size} ---")
+    for model in models:
+        # Look up GQA info from profiles
+        profile_info = ""
+        for pval in MODEL_PROFILES.values():
+            if pval["name"] == model:
+                profile_info = (f" (GQA={pval['gqa_ratio']}, "
+                                f"{pval['query_heads']}q/{pval['kv_heads']}kv)")
+                break
 
-        for mode_name in mode_names:
-            current += 1
-            mode = MODES[mode_name]
-            fused = is_fused_active(mode_name, input_len)
-            tag = " [FUSED]" if fused else ""
+        print(f"\n{'=' * 80}")
+        print(f"Model: {model}{profile_info}")
+        print(f"{'=' * 80}")
 
-            print(f"  [{current}/{total}] {mode['short']:<12}{tag}",
-                  end="", flush=True)
+        for input_len in input_lens:
+            print(f"\n--- input_len={input_len}, output_len={output_len}, "
+                  f"batch_size={batch_size} ---")
 
-            res = run_single_model_benchmark(
-                mode_name, model, input_len, output_len,
-                batch_size, num_iters, dtype, max_model_len,
-            )
+            for mode_name in mode_names:
+                current += 1
+                mode = MODES[mode_name]
+                fused = is_fused_active(mode_name, input_len)
+                tag = " [FUSED]" if fused else ""
 
-            avg = res["avg_latency"]
-            if avg > 0:
-                print(f"  -> {avg:.4f}s ({avg*1000:.1f}ms)")
-            else:
-                print(f"  -> FAILED")
+                print(f"  [{current}/{total}] {mode['short']:<12}{tag}",
+                      end="", flush=True)
 
-            results.append({
-                "mode": mode_name,
-                "mode_label": mode["short"],
-                "input_len": input_len,
-                "output_len": output_len,
-                "batch_size": batch_size,
-                "avg_latency_s": round(avg, 6),
-                "avg_latency_ms": round(avg * 1000, 2),
-                "percentiles": res["percentiles"],
-                "fused_active": fused,
-                "partition_size": mode["partition_size"],
-            })
+                res = run_single_model_benchmark(
+                    mode_name, model, input_len, output_len,
+                    batch_size, num_iters, dtype, max_model_len,
+                    enforce_eager,
+                )
+
+                avg = res["avg_latency"]
+                if avg > 0:
+                    print(f"  -> {avg:.4f}s ({avg*1000:.1f}ms)")
+                else:
+                    print(f"  -> FAILED")
+
+                results.append({
+                    "mode": mode_name,
+                    "mode_label": mode["short"],
+                    "model": model,
+                    "input_len": input_len,
+                    "output_len": output_len,
+                    "batch_size": batch_size,
+                    "avg_latency_s": round(avg, 6),
+                    "avg_latency_ms": round(avg * 1000, 2),
+                    "percentiles": res["percentiles"],
+                    "fused_active": fused,
+                    "partition_size": mode["partition_size"],
+                })
 
     data = {
         "metadata": {
@@ -485,7 +537,7 @@ def run_model_benchmark_suite(
             "benchmark_type": "model",
             "git_branch": git_info["branch"],
             "git_commit": git_info["commit"],
-            "model": model,
+            "models": models,
             "modes": mode_names,
             "input_lens": input_lens,
             "output_len": output_len,
@@ -493,6 +545,7 @@ def run_model_benchmark_suite(
             "num_iters": num_iters,
             "dtype": dtype,
             "max_model_len": max_model_len,
+            "enforce_eager": enforce_eager,
         },
         "results": results,
     }
@@ -665,84 +718,109 @@ def print_model_comparison_table(data: dict):
         return
 
     from collections import defaultdict
-    grouped = defaultdict(dict)
+
+    # Group by model
+    model_list = sorted(set(r.get("model", data["metadata"].get("model", "?"))
+                            for r in results),
+                        key=lambda m: results[[r.get("model", "") for r in results].index(m)]["input_len"] if m in [r.get("model", "") for r in results] else 0)
+    # Simpler: preserve insertion order
+    seen = []
     for r in results:
-        key = (r["input_len"], r["output_len"], r["batch_size"])
-        grouped[key][r["mode"]] = r
+        m = r.get("model", data["metadata"].get("model", "?"))
+        if m not in seen:
+            seen.append(m)
+    model_list = seen
 
-    print("\n" + "=" * (50 + 16 * len(mode_names)))
-    print("MODEL LATENCY COMPARISON")
-    print("=" * (50 + 16 * len(mode_names)))
-    print(f"  Model: {data['metadata']['model']}")
-    print(f"  Branch: {data['metadata'].get('git_branch', '?')} "
-          f"({data['metadata'].get('git_commit', '?')})")
+    for model in model_list:
+        model_results = [r for r in results
+                         if r.get("model", data["metadata"].get("model", "?")) == model]
 
-    # Header
-    mode_headers = "".join(
-        f" {'':>1}{MODES[m]['short']:>11}ms" for m in mode_names
-    )
-    print(f"\n{'In Len':>7} {'Out':>4} {'Batch':>6} |{mode_headers} | "
-          f"{'Best':>10} {'vs Base':>8}")
-    print("-" * (50 + 16 * len(mode_names)))
+        # Look up profile info
+        profile_info = ""
+        for pval in MODEL_PROFILES.values():
+            if pval["name"] == model:
+                profile_info = (f"  GQA={pval['gqa_ratio']} "
+                                f"({pval['query_heads']}q/{pval['kv_heads']}kv)")
+                break
 
-    for (input_len, output_len, batch_size) in sorted(grouped.keys()):
-        modes = grouped[(input_len, output_len, batch_size)]
+        grouped = defaultdict(dict)
+        for r in model_results:
+            key = (r["input_len"], r["output_len"], r["batch_size"])
+            grouped[key][r["mode"]] = r
 
-        latencies = {}
-        for m in mode_names:
-            if m in modes and modes[m]["avg_latency_ms"] > 0:
-                latencies[m] = modes[m]["avg_latency_ms"]
+        print("\n" + "=" * (50 + 16 * len(mode_names)))
+        print(f"MODEL LATENCY COMPARISON")
+        print("=" * (50 + 16 * len(mode_names)))
+        print(f"  Model: {model}{profile_info}")
+        print(f"  Branch: {data['metadata'].get('git_branch', '?')} "
+              f"({data['metadata'].get('git_commit', '?')})")
 
-        if not latencies:
-            continue
+        # Header
+        mode_headers = "".join(
+            f" {'':>1}{MODES[m]['short']:>11}ms" for m in mode_names
+        )
+        print(f"\n{'In Len':>7} {'Out':>4} {'Batch':>6} |{mode_headers} | "
+              f"{'Best':>10} {'vs Base':>8}")
+        print("-" * (50 + 16 * len(mode_names)))
 
-        baseline_ms = latencies.get("baseline", 0)
+        for (input_len, output_len, batch_size) in sorted(grouped.keys()):
+            modes = grouped[(input_len, output_len, batch_size)]
 
-        cols = ""
-        for m in mode_names:
-            if m in latencies:
-                val = latencies[m]
-                fused = modes[m].get("fused_active", False)
-                marker = "*" if fused else " "
-                cols += f" {marker}{val:>10.1f}ms"
-            else:
-                cols += f"  {'N/A':>10}  "
+            latencies = {}
+            for m in mode_names:
+                if m in modes and modes[m]["avg_latency_ms"] > 0:
+                    latencies[m] = modes[m]["avg_latency_ms"]
 
-        best_mode = min(latencies, key=lambda k: latencies[k])
-        best_ms = latencies[best_mode]
-        if baseline_ms > 0:
-            speedup = baseline_ms / best_ms
-            speedup_str = f"{speedup:.2f}x"
-        else:
-            speedup_str = "N/A"
-
-        print(f"{input_len:>7} {output_len:>4} {batch_size:>6} |{cols} | "
-              f"{MODES[best_mode]['short']:>10} {speedup_str:>8}")
-
-    print("-" * (50 + 16 * len(mode_names)))
-    print("  * = fused (single-partition) path active")
-
-    # Per-mode summary vs baseline
-    if "baseline" in mode_names and len(mode_names) > 1:
-        print(f"\nSpeedup summary vs baseline:")
-        for m in mode_names:
-            if m == "baseline":
+            if not latencies:
                 continue
-            speedups = []
-            for key, modes in grouped.items():
-                if "baseline" in modes and m in modes:
-                    b = modes["baseline"]["avg_latency_ms"]
-                    o = modes[m]["avg_latency_ms"]
-                    if b > 0 and o > 0:
-                        speedups.append(b / o)
-            if speedups:
-                avg_sp = sum(speedups) / len(speedups)
-                max_sp = max(speedups)
-                min_sp = min(speedups)
-                print(f"  {MODES[m]['short']:<14}: "
-                      f"avg {avg_sp:.3f}x, "
-                      f"best {max_sp:.3f}x, "
-                      f"worst {min_sp:.3f}x")
+
+            baseline_ms = latencies.get("baseline", 0)
+
+            cols = ""
+            for m in mode_names:
+                if m in latencies:
+                    val = latencies[m]
+                    fused = modes[m].get("fused_active", False)
+                    marker = "*" if fused else " "
+                    cols += f" {marker}{val:>10.1f}ms"
+                else:
+                    cols += f"  {'N/A':>10}  "
+
+            best_mode = min(latencies, key=lambda k: latencies[k])
+            best_ms = latencies[best_mode]
+            if baseline_ms > 0:
+                speedup = baseline_ms / best_ms
+                speedup_str = f"{speedup:.2f}x"
+            else:
+                speedup_str = "N/A"
+
+            print(f"{input_len:>7} {output_len:>4} {batch_size:>6} |{cols} | "
+                  f"{MODES[best_mode]['short']:>10} {speedup_str:>8}")
+
+        print("-" * (50 + 16 * len(mode_names)))
+        print("  * = fused (single-partition) path active")
+
+        # Per-mode summary vs baseline
+        if "baseline" in mode_names and len(mode_names) > 1:
+            print(f"\nSpeedup summary vs baseline:")
+            for m in mode_names:
+                if m == "baseline":
+                    continue
+                speedups = []
+                for key, modes in grouped.items():
+                    if "baseline" in modes and m in modes:
+                        b = modes["baseline"]["avg_latency_ms"]
+                        o = modes[m]["avg_latency_ms"]
+                        if b > 0 and o > 0:
+                            speedups.append(b / o)
+                if speedups:
+                    avg_sp = sum(speedups) / len(speedups)
+                    max_sp = max(speedups)
+                    min_sp = min(speedups)
+                    print(f"  {MODES[m]['short']:<14}: "
+                          f"avg {avg_sp:.3f}x, "
+                          f"best {max_sp:.3f}x, "
+                          f"worst {min_sp:.3f}x")
 
 
 def print_model_markdown_table(data: dict):
@@ -754,40 +832,60 @@ def print_model_markdown_table(data: dict):
         return
 
     from collections import defaultdict
-    grouped = defaultdict(dict)
+
+    # Preserve model order
+    seen = []
     for r in results:
-        key = (r["input_len"], r["output_len"], r["batch_size"])
-        grouped[key][r["mode"]] = r
+        m = r.get("model", data["metadata"].get("model", "?"))
+        if m not in seen:
+            seen.append(m)
+    model_list = seen
 
-    print("\n" + "=" * 70)
-    print("MARKDOWN TABLE (copy into report)")
-    print("=" * 70 + "\n")
+    for model in model_list:
+        model_results = [r for r in results
+                         if r.get("model", data["metadata"].get("model", "?")) == model]
 
-    mode_cols = " | ".join(f"{MODES[m]['short']} (ms)" for m in mode_names)
-    print(f"| In Len | Out Len | Batch | {mode_cols} | Best | Speedup |")
-    sep_cols = " | ".join("---:" for _ in mode_names)
-    print(f"|--------|---------|-------|{sep_cols}|------|---------|")
+        profile_info = ""
+        for pval in MODEL_PROFILES.values():
+            if pval["name"] == model:
+                profile_info = f" (GQA={pval['gqa_ratio']})"
+                break
 
-    for (input_len, output_len, batch_size) in sorted(grouped.keys()):
-        modes = grouped[(input_len, output_len, batch_size)]
-        latencies = {}
-        for m in mode_names:
-            if m in modes and modes[m]["avg_latency_ms"] > 0:
-                latencies[m] = modes[m]["avg_latency_ms"]
+        grouped = defaultdict(dict)
+        for r in model_results:
+            key = (r["input_len"], r["output_len"], r["batch_size"])
+            grouped[key][r["mode"]] = r
 
-        cols = " | ".join(
-            f"{latencies[m]:.1f}" if m in latencies else "N/A"
-            for m in mode_names
-        )
+        short_name = model.split("/")[-1]
+        print("\n" + "=" * 70)
+        print(f"MARKDOWN TABLE: {short_name}{profile_info}")
+        print("=" * 70 + "\n")
 
-        baseline_ms = latencies.get("baseline", 0)
-        best_mode = min(latencies, key=lambda k: latencies[k]) if latencies else "N/A"
-        best_ms = latencies.get(best_mode, 0)
-        speedup = (f"{baseline_ms / best_ms:.2f}x"
-                   if baseline_ms > 0 and best_ms > 0 else "N/A")
+        mode_cols = " | ".join(f"{MODES[m]['short']} (ms)" for m in mode_names)
+        print(f"| In Len | Out Len | Batch | {mode_cols} | Best | Speedup |")
+        sep_cols = " | ".join("---:" for _ in mode_names)
+        print(f"|--------|---------|-------|{sep_cols}|------|---------|")
 
-        print(f"| {input_len} | {output_len} | {batch_size} | {cols} | "
-              f"{MODES.get(best_mode, {}).get('short', 'N/A')} | {speedup} |")
+        for (input_len, output_len, batch_size) in sorted(grouped.keys()):
+            modes = grouped[(input_len, output_len, batch_size)]
+            latencies = {}
+            for m in mode_names:
+                if m in modes and modes[m]["avg_latency_ms"] > 0:
+                    latencies[m] = modes[m]["avg_latency_ms"]
+
+            cols = " | ".join(
+                f"{latencies[m]:.1f}" if m in latencies else "N/A"
+                for m in mode_names
+            )
+
+            baseline_ms = latencies.get("baseline", 0)
+            best_mode = min(latencies, key=lambda k: latencies[k]) if latencies else "N/A"
+            best_ms = latencies.get(best_mode, 0)
+            speedup = (f"{baseline_ms / best_ms:.2f}x"
+                       if baseline_ms > 0 and best_ms > 0 else "N/A")
+
+            print(f"| {input_len} | {output_len} | {batch_size} | {cols} | "
+                  f"{MODES.get(best_mode, {}).get('short', 'N/A')} | {speedup} |")
 
 
 def save_results(data: dict, output_dir: str):
@@ -795,9 +893,10 @@ def save_results(data: dict, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
 
     branch = data["metadata"].get("git_branch", "unknown")
+    btype = data["metadata"].get("benchmark_type", "kernel")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_branch = branch.replace("/", "_").replace(" ", "_")
-    filename = f"{safe_branch}_{timestamp}.json"
+    filename = f"{btype}_{safe_branch}_{timestamp}.json"
     filepath = os.path.join(output_dir, filename)
 
     with open(filepath, "w") as f:
@@ -908,10 +1007,22 @@ Examples:
         help="End-to-end model latency benchmark",
     )
     add_common_args(model_parser)
-    model_parser.add_argument(
-        "--model", type=str, required=True,
-        help="HuggingFace model name (e.g. meta-llama/Llama-3.1-8B-Instruct)",
+
+    model_group = model_parser.add_mutually_exclusive_group(required=True)
+    model_group.add_argument(
+        "--model", type=str, nargs="+",
+        help="HuggingFace model name(s) (e.g. Qwen/Qwen2.5-7B-Instruct)",
     )
+    profile_keys = list(MODEL_PROFILES.keys())
+    model_group.add_argument(
+        "--preset", type=str, nargs="+",
+        choices=profile_keys + ["all"],
+        help=("Predefined model profile(s): "
+              + ", ".join(f"{k} ({v['description']})"
+                          for k, v in MODEL_PROFILES.items())
+              + ", or 'all' for all profiles"),
+    )
+
     model_parser.add_argument(
         "--input-lens", type=int, nargs="+",
         default=[64, 128, 256, 512],
@@ -937,6 +1048,10 @@ Examples:
     model_parser.add_argument(
         "--max-model-len", type=int, default=4096,
         help="Max model context length (default: 4096)",
+    )
+    model_parser.add_argument(
+        "--no-enforce-eager", action="store_true",
+        help="Disable --enforce-eager (default: enforce-eager is ON)",
     )
 
     args = parser.parse_args()
@@ -1007,15 +1122,26 @@ Examples:
             data = all_data[0]
 
     elif args.command == "model":
+        # Resolve model list from --model or --preset
+        if args.preset:
+            if "all" in args.preset:
+                presets = list(MODEL_PROFILES.keys())
+            else:
+                presets = args.preset
+            models = [MODEL_PROFILES[p]["name"] for p in presets]
+        else:
+            models = args.model
+
         data = run_model_benchmark_suite(
             mode_names=args.modes,
-            model=args.model,
+            models=models,
             input_lens=args.input_lens,
             output_len=args.output_len,
             batch_size=args.batch_size,
             num_iters=args.num_iters,
             dtype=args.dtype,
             max_model_len=args.max_model_len,
+            enforce_eager=not args.no_enforce_eager,
         )
 
         print_model_comparison_table(data)
