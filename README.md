@@ -19,6 +19,131 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+## AMD MI300X: Optimized PagedAttention v2 Kernel
+
+This fork extends vLLM with a custom PagedAttention v2 kernel optimized for AMD MI300X GPUs, delivering up to **17.6% higher throughput** on real LLM workloads.
+
+### Optimization Overview
+
+Five kernel modes are implemented and benchmarkable:
+
+| Mode | Description |
+|------|-------------|
+| `baseline` | Unmodified vLLM ROCm kernel |
+| `fused` | Single-partition sequences skip the reduce pass |
+| `mfma4_all` | MFMA4 instruction path for all GQA ratios (256-token partitions) |
+| `mfma4_all_512` | MFMA4 with 512-token partitions |
+| `mfma4_all_1024` | MFMA4 with 1024-token partitions (best for GQA ≤ 12) |
+
+Modes are selected via environment variables — no recompilation needed:
+
+```bash
+# baseline (default)
+python script.py
+
+# fused short-seq
+VLLM_ROCM_FUSED_SHORT_SEQ=1 python script.py
+
+# mfma4_all (256-partition)
+VLLM_ROCM_MFMA4_ALL=1 python script.py
+
+# mfma4_all_512
+VLLM_ROCM_MFMA4_ALL=1 VLLM_ROCM_PARTITION_512=1 python script.py
+
+# mfma4_all_1024
+VLLM_ROCM_MFMA4_ALL=1 VLLM_ROCM_PARTITION_1024=1 python script.py
+```
+
+### Requirements
+
+- AMD MI300X GPU with ROCm 6.x
+- vLLM built from source (this repo)
+- Python 3.10+
+- HuggingFace access token for gated models (Llama, Mistral)
+
+### Build from Source (ROCm)
+
+```bash
+git clone https://github.com/MohamedSayedFathy/TUM_Practical-_Course.git
+cd TUM_Practical-_Course
+
+pip install -e ".[rocm]"
+```
+
+### Running Correctness Tests
+
+Two test suites verify that all kernel modes produce identical outputs to the baseline.
+
+**Unit test** — runs the attention kernel directly on synthetic tensors:
+
+```bash
+pytest tests/test_kernel_correctness.py -v
+```
+
+**Application test** — runs TinyLlama end-to-end with greedy decoding and compares token outputs:
+
+```bash
+pytest tests/test_model_correctness.py -v
+```
+
+### Running Benchmarks
+
+All benchmarks are in `benchmark_fused_short_seq.py`. Each mode is run in a separate subprocess to avoid env-var caching issues.
+
+#### Kernel Microbenchmark
+
+Measures raw attention kernel latency across GQA ratios and sequence lengths:
+
+```bash
+python benchmark_fused_short_seq.py kernel --preset all
+```
+
+#### Throughput Benchmark (Real Workload)
+
+Measures end-to-end tokens/second using ShareGPT conversation data:
+
+```bash
+# Single model
+python benchmark_fused_short_seq.py throughput \
+  --models meta-llama/Llama-3.1-8B-Instruct \
+  --num-prompts 500 \
+  --max-model-len 12000 \
+  --enforce-eager
+
+# All three models
+python benchmark_fused_short_seq.py throughput \
+  --models meta-llama/Llama-3.1-8B-Instruct Qwen/Qwen2.5-7B-Instruct mistralai/Mistral-7B-Instruct-v0.3 \
+  --num-prompts 500 \
+  --max-model-len 12000 \
+  --enforce-eager
+```
+
+#### Latency Sweep
+
+Measures per-batch latency across input lengths, output lengths, and batch sizes:
+
+```bash
+python benchmark_fused_short_seq.py latency_sweep \
+  --models meta-llama/Llama-3.1-8B-Instruct \
+  --input-lens 500 1000 4000 8000 12000 \
+  --output-lens 128 \
+  --batch-sizes 32 64 128 256 \
+  --max-model-len 16384 \
+  --enforce-eager
+```
+
+#### Display Saved Results
+
+```bash
+# Show throughput results
+python benchmark_fused_short_seq.py display --file benchmark_results/throughput_*.json
+
+# Show latency results
+python benchmark_fused_short_seq.py display --file benchmark_results/latency_sweep_*.json
+```
+
+---
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
