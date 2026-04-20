@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Benchmark Runner for Fused Short-Seq Kernel Optimization (AMD MI300X)
 
@@ -38,12 +39,11 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List
-
 
 # ============================================================================
 # Benchmark Execution
 # ============================================================================
+
 
 def run_single_benchmark(
     seq_len: int,
@@ -62,13 +62,19 @@ def run_single_benchmark(
     cmd = [
         sys.executable,
         "benchmark_paged_attention.py",
-        "--version", "v2",
+        "--version",
+        "v2",
         "--custom-paged-attn",
-        "--seq-len", str(seq_len),
-        "--batch-size", str(batch_size),
-        "--num-query-heads", str(num_query_heads),
-        "--num-kv-heads", str(num_kv_heads),
-        "--head-size", str(head_size),
+        "--seq-len",
+        str(seq_len),
+        "--batch-size",
+        str(batch_size),
+        "--num-query-heads",
+        str(num_query_heads),
+        "--num-kv-heads",
+        str(num_kv_heads),
+        "--head-size",
+        str(head_size),
     ]
 
     latencies = []
@@ -79,7 +85,9 @@ def run_single_benchmark(
                 capture_output=True,
                 text=True,
                 env=env,
-                cwd=os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks", "kernels"),
+                cwd=os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "benchmarks", "kernels"
+                ),
                 timeout=120,
             )
 
@@ -87,13 +95,13 @@ def run_single_benchmark(
             if match:
                 latencies.append(float(match.group(1)))
             else:
-                print(f"    Warning: Could not parse output (run {run+1})")
+                print(f"    Warning: Could not parse output (run {run + 1})")
                 if result.stderr:
                     # Print first line of stderr for diagnosis
                     first_line = result.stderr.strip().split("\n")[0]
                     print(f"    stderr: {first_line}")
         except subprocess.TimeoutExpired:
-            print(f"    Warning: Run {run+1} timed out")
+            print(f"    Warning: Run {run + 1} timed out")
         except Exception as e:
             print(f"    Error: {e}")
 
@@ -104,8 +112,8 @@ def run_single_benchmark(
 
 
 def run_benchmark_suite(
-    seq_lengths: List[int],
-    batch_sizes: List[int],
+    seq_lengths: list[int],
+    batch_sizes: list[int],
     num_runs: int = 3,
     num_query_heads: int = 64,
     num_kv_heads: int = 8,
@@ -123,14 +131,14 @@ def run_benchmark_suite(
     print("\n" + "=" * 70)
     print("Fused Short-Seq Kernel Optimization Benchmark")
     print("=" * 70)
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Sequence lengths:  {seq_lengths}")
     print(f"  Batch sizes:       {batch_sizes}")
     print(f"  Runs per config:   {num_runs}")
     print(f"  Query heads:       {num_query_heads}")
     print(f"  KV heads:          {num_kv_heads}")
     print(f"  Head size:         {head_size}")
-    print(f"  Partition size:    256 tokens")
+    print("  Partition size:    256 tokens")
     print(f"  Total configs:     {total}")
     print("-" * 70)
 
@@ -144,8 +152,12 @@ def run_benchmark_suite(
             # Run optimized (fused kernel for short seqs)
             print("  Optimized (FUSED_SHORT_SEQ=1)...", end=" ", flush=True)
             optimized_us = run_single_benchmark(
-                seq_len, batch_size, num_runs, optimized=True,
-                num_query_heads=num_query_heads, num_kv_heads=num_kv_heads,
+                seq_len,
+                batch_size,
+                num_runs,
+                optimized=True,
+                num_query_heads=num_query_heads,
+                num_kv_heads=num_kv_heads,
                 head_size=head_size,
             )
             print(f"{optimized_us:.3f} us")
@@ -153,37 +165,47 @@ def run_benchmark_suite(
             # Run baseline (always 2-kernel path)
             print("  Baseline  (FUSED_SHORT_SEQ=0)...", end=" ", flush=True)
             baseline_us = run_single_benchmark(
-                seq_len, batch_size, num_runs, optimized=False,
-                num_query_heads=num_query_heads, num_kv_heads=num_kv_heads,
+                seq_len,
+                batch_size,
+                num_runs,
+                optimized=False,
+                num_query_heads=num_query_heads,
+                num_kv_heads=num_kv_heads,
                 head_size=head_size,
             )
             print(f"{baseline_us:.3f} us")
 
             # Compute derived metrics
             improvement_us = baseline_us - optimized_us
-            improvement_pct = ((improvement_us / baseline_us) * 100) if baseline_us > 0 else 0.0
+            improvement_pct = (
+                ((improvement_us / baseline_us) * 100) if baseline_us > 0 else 0.0
+            )
             speedup = (baseline_us / optimized_us) if optimized_us > 0 else 1.0
             applies = seq_len <= 256
             num_partitions = (seq_len + 255) // 256
 
             marker = "YES" if applies else "no"
-            print(f"  -> Improvement: {improvement_pct:.1f}%, Speedup: {speedup:.2f}x, "
-                  f"Single partition: {marker}")
+            print(
+                f"  -> Improvement: {improvement_pct:.1f}%, Speedup: {speedup:.2f}x, "
+                f"Single partition: {marker}"
+            )
 
-            results.append({
-                "seq_len": seq_len,
-                "batch_size": batch_size,
-                "optimized_us": round(optimized_us, 3),
-                "baseline_us": round(baseline_us, 3),
-                "improvement_us": round(improvement_us, 3),
-                "improvement_pct": round(improvement_pct, 1),
-                "speedup": round(speedup, 3),
-                "applies_optimization": applies,
-                "num_partitions": num_partitions,
-                "num_query_heads": num_query_heads,
-                "num_kv_heads": num_kv_heads,
-                "head_size": head_size,
-            })
+            results.append(
+                {
+                    "seq_len": seq_len,
+                    "batch_size": batch_size,
+                    "optimized_us": round(optimized_us, 3),
+                    "baseline_us": round(baseline_us, 3),
+                    "improvement_us": round(improvement_us, 3),
+                    "improvement_pct": round(improvement_pct, 1),
+                    "speedup": round(speedup, 3),
+                    "applies_optimization": applies,
+                    "num_partitions": num_partitions,
+                    "num_query_heads": num_query_heads,
+                    "num_kv_heads": num_kv_heads,
+                    "head_size": head_size,
+                }
+            )
 
     data = {
         "metadata": {
@@ -206,6 +228,7 @@ def run_benchmark_suite(
 # Text Output
 # ============================================================================
 
+
 def print_text_table(data: dict):
     """Print formatted text results table."""
 
@@ -218,17 +241,21 @@ def print_text_table(data: dict):
     print("RESULTS SUMMARY")
     print("=" * 90)
 
-    header = (f"{'Seq Len':>8} | {'Batch':>6} | {'Optimized':>12} | {'Baseline':>12} | "
-              f"{'Improvement':>12} | {'Speedup':>8} | {'%':>7} | {'Fused':>5}")
+    header = (
+        f"{'Seq Len':>8} | {'Batch':>6} | {'Optimized':>12} | {'Baseline':>12} | "
+        f"{'Improvement':>12} | {'Speedup':>8} | {'%':>7} | {'Fused':>5}"
+    )
     print(f"\n{header}")
     print("-" * 90)
 
     for r in sorted(results, key=lambda x: (x["batch_size"], x["seq_len"])):
         fused = "YES" if r["applies_optimization"] else "no"
-        print(f"{r['seq_len']:>8} | {r['batch_size']:>6} | "
-              f"{r['optimized_us']:>10.3f}us | {r['baseline_us']:>10.3f}us | "
-              f"{r['improvement_us']:>10.3f}us | {r['speedup']:>7.2f}x | "
-              f"{r['improvement_pct']:>6.1f}% | {fused:>5}")
+        print(
+            f"{r['seq_len']:>8} | {r['batch_size']:>6} | "
+            f"{r['optimized_us']:>10.3f}us | {r['baseline_us']:>10.3f}us | "
+            f"{r['improvement_us']:>10.3f}us | {r['speedup']:>7.2f}x | "
+            f"{r['improvement_pct']:>6.1f}% | {fused:>5}"
+        )
 
     print("-" * 90)
 
@@ -239,7 +266,7 @@ def print_text_table(data: dict):
         avg_us = sum(r["improvement_us"] for r in opt) / len(opt)
         max_pct = max(r["improvement_pct"] for r in opt)
         avg_speedup = sum(r["speedup"] for r in opt) / len(opt)
-        print(f"\nOptimization active (seq_len <= 256):")
+        print("\nOptimization active (seq_len <= 256):")
         print(f"  Avg improvement:  {avg_pct:.1f}%")
         print(f"  Max improvement:  {max_pct:.1f}%")
         print(f"  Avg speedup:      {avg_speedup:.2f}x")
@@ -248,10 +275,12 @@ def print_text_table(data: dict):
     # Check non-optimized (should show ~0 difference)
     non_opt = [r for r in results if not r["applies_optimization"]]
     if non_opt:
-        print(f"\nBaseline verification (seq_len > 256, should be ~0 difference):")
+        print("\nBaseline verification (seq_len > 256, should be ~0 difference):")
         for r in non_opt:
-            print(f"  seq_len={r['seq_len']}: {abs(r['improvement_us']):.3f} us "
-                  f"({abs(r['improvement_pct']):.1f}%)")
+            print(
+                f"  seq_len={r['seq_len']}: {abs(r['improvement_us']):.3f} us "
+                f"({abs(r['improvement_pct']):.1f}%)"
+            )
 
 
 def print_markdown_table(data: dict):
@@ -265,16 +294,22 @@ def print_markdown_table(data: dict):
     print("MARKDOWN TABLE (copy into report)")
     print("=" * 70 + "\n")
 
-    print("| Seq Length | Batch | Partitions | Optimized (us) | Baseline (us) | "
-          "Improvement | Speedup | Fused |")
-    print("|------------|-------|------------|----------------|---------------|"
-          "-------------|---------|-------|")
+    print(
+        "| Seq Length | Batch | Partitions | Optimized (us) | Baseline (us) | "
+        "Improvement | Speedup | Fused |"
+    )
+    print(
+        "|------------|-------|------------|----------------|---------------|"
+        "-------------|---------|-------|"
+    )
 
     for r in sorted(results, key=lambda x: (x["batch_size"], x["seq_len"])):
         fused = "Yes" if r["applies_optimization"] else "No"
-        print(f"| {r['seq_len']} | {r['batch_size']} | {r['num_partitions']} | "
-              f"{r['optimized_us']:.3f} | {r['baseline_us']:.3f} | "
-              f"{r['improvement_pct']:.1f}% | {r['speedup']:.2f}x | {fused} |")
+        print(
+            f"| {r['seq_len']} | {r['batch_size']} | {r['num_partitions']} | "
+            f"{r['optimized_us']:.3f} | {r['baseline_us']:.3f} | "
+            f"{r['improvement_pct']:.1f}% | {r['speedup']:.2f}x | {fused} |"
+        )
 
 
 def save_results(data: dict, output_path: str):
@@ -289,6 +324,7 @@ def save_results(data: dict, output_path: str):
 # ============================================================================
 # Main
 # ============================================================================
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -312,28 +348,54 @@ Examples:
 
   # Then generate graphs separately:
   python benchmark_visualization.py --data-file results.json --graphs all
-        """
+        """,
     )
 
-    parser.add_argument("--seq-lengths", type=int, nargs="+",
-                        default=[64, 128, 256, 512, 1024],
-                        help="Sequence lengths to test (default: 64 128 256 512 1024)")
-    parser.add_argument("--batch-sizes", type=int, nargs="+",
-                        default=[32],
-                        help="Batch sizes to test (default: 32)")
-    parser.add_argument("--num-runs", type=int, default=3,
-                        help="Number of runs per configuration (default: 3)")
-    parser.add_argument("--num-query-heads", type=int, default=64,
-                        help="Number of query heads (default: 64)")
-    parser.add_argument("--num-kv-heads", type=int, default=8,
-                        help="Number of KV heads (default: 8)")
-    parser.add_argument("--head-size", type=int, default=128,
-                        choices=[64, 80, 96, 112, 120, 128, 192, 256],
-                        help="Head size (default: 128)")
-    parser.add_argument("--output", type=str, default="results.json",
-                        help="Output JSON file path (default: results.json)")
-    parser.add_argument("--markdown", action="store_true",
-                        help="Also print markdown table for reports")
+    parser.add_argument(
+        "--seq-lengths",
+        type=int,
+        nargs="+",
+        default=[64, 128, 256, 512, 1024],
+        help="Sequence lengths to test (default: 64 128 256 512 1024)",
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="+",
+        default=[32],
+        help="Batch sizes to test (default: 32)",
+    )
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=3,
+        help="Number of runs per configuration (default: 3)",
+    )
+    parser.add_argument(
+        "--num-query-heads",
+        type=int,
+        default=64,
+        help="Number of query heads (default: 64)",
+    )
+    parser.add_argument(
+        "--num-kv-heads", type=int, default=8, help="Number of KV heads (default: 8)"
+    )
+    parser.add_argument(
+        "--head-size",
+        type=int,
+        default=128,
+        choices=[64, 80, 96, 112, 120, 128, 192, 256],
+        help="Head size (default: 128)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="results.json",
+        help="Output JSON file path (default: results.json)",
+    )
+    parser.add_argument(
+        "--markdown", action="store_true", help="Also print markdown table for reports"
+    )
 
     args = parser.parse_args()
 
@@ -359,7 +421,10 @@ Examples:
     print("\n" + "=" * 70)
     print("Benchmark complete!")
     print(f"Results saved to: {args.output}")
-    print(f"Generate graphs:  python benchmark_visualization.py --data-file {args.output} --graphs all")
+    print(
+        "Generate graphs:  python benchmark_visualization.py "
+        f"--data-file {args.output} --graphs all"
+    )
     print("=" * 70 + "\n")
 
 
